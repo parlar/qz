@@ -1,53 +1,53 @@
 [package]
-name = "fqz"
+name = "qz"
 version = "0.1.0"
 edition = "2024"
-authors = ["FQZ Contributors"]
+authors = ["QZ Contributors"]
 description = "High-performance FASTQ compression using columnar encoding and BSC/BWT"
 license = "SEE LICENSE FILE"
 readme = "README.md"
 
 [lib]
-name = "fqz"
+name = "qz"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # CLI argument parsing
-clap = { version = "4.5", features = ["derive", "cargo"] }
+clap = { version = "4.5", features = ["derive"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "2.0"
 
 # Parallelism (replaces OpenMP)
 rayon = "1.10"
-num_cpus = "1.16"
 
 # Compression libraries
 flate2 = "1.0"
 zstd = "0.13"
 constriction = "0.4"
-bzip2 = "0.6.1"
-xz2 = "0.1.7"
+openzl-sys = "0.1"
 
-# I/O utilities
-byteorder = "1.5"
+# Fast hashing for integer keys
+rustc-hash = "2"
+
+# Minimizer computation for sequence compression
+minimizer-iter = "1.2"
+
+# Syncmer-based k-mer selection for template indexing
+syncmers = "0.1"
+
+
+# FFI
 libc = "0.2"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Serialization (for compression params)
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
-
 [build-dependencies]
 cc = "1.0"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.5"
 tempfile = "3.13"
 
 [profile.release]

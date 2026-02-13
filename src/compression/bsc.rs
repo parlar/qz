@@ -26,7 +26,6 @@ const LIBBSC_CODER_QLFC_ADAPTIVE: c_int = 2;
 
 // Features
 const LIBBSC_FEATURE_FASTMODE: c_int = 1;
-const LIBBSC_FEATURE_MULTITHREADING: c_int = 2;
 
 // Header size
 const LIBBSC_HEADER_SIZE: usize = 28;

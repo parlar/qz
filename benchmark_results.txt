@@ -1,0 +1,114 @@
+QZ Benchmark Results
+====================
+Date: 2026-02-11
+Machine: 72 cores, Linux 6.8.0-86-generic
+
+Input: ERR3239334_1.1m.fastq (1M reads, 150bp WGS)
+Input size: 366,173,895 bytes (349.2 MB)
+
+All tools run with 72 threads.
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+Tool          | Compressed   | Ratio  | Compress | Decompress | Peak Mem (C) | Peak Mem (D)
+              | Size (bytes) |        | Wall (s) | Wall (s)   | (MB)         | (MB)
+--------------+--------------+--------+----------+------------+--------------+-------------
+QZ (BSC)      |   47,301,798 |  7.74x |     3.98 |       2.56 |       1,773  |         926
+SPRING        |   48,793,600 |  7.50x |    13.65 |       6.92 |       3,201  |       1,153
+pigz          |   76,999,763 |  4.76x |     0.41 |       0.83 |          24  |           2
+
+================================================================================
+DETAILED RESULTS
+================================================================================
+
+--- QZ (BSC adaptive, default settings) ---
+
+  Compression:
+    Wall time:        3.98 s
+    User time:       24.54 s
+    CPU utilization:   658%
+    Peak memory:    1,816 MB (1,773 MB RSS)
+    Output size:   47,301,798 bytes (45.1 MB)
+    Ratio:         7.74x (vs raw FASTQ)
+
+    Stream breakdown:
+      Headers:    9,252,646 bytes (19.6%)
+      Sequences: 34,781,336 bytes (73.5%)
+      Qualities:  3,267,764 bytes  (6.9%)
+      Metadata:          52 bytes  (0.0%)
+
+  Decompression:
+    Wall time:        2.56 s
+    User time:       14.62 s
+    CPU utilization:   621%
+    Peak memory:      949 MB (926 MB RSS)
+    Output size:  366,173,895 bytes (exact match)
+
+--- SPRING (read reordering enabled, default settings) ---
+
+  Compression:
+    Wall time:       13.65 s
+    User time:      158.10 s
+    CPU utilization: 1,221%
+    Peak memory:    3,278 MB (3,201 MB RSS)
+    Output size:   48,793,600 bytes (46.5 MB)
+    Ratio:         7.50x (vs raw FASTQ)
+
+    Stream breakdown (from SPRING output):
+      Reads:       32,728,215 bytes
+      Quality:      2,886,614 bytes
+      ID:          13,023,833 bytes
+
+  Decompression:
+    Wall time:        6.92 s
+    User time:       25.26 s
+    CPU utilization:   407%
+    Peak memory:    1,180 MB (1,153 MB RSS)
+    Output size:  366,173,895 bytes (exact match)
+
+  Note: SPRING reorders reads for better compression. Original read order is NOT preserved.
+        916,625 / 1,000,000 reads (91.7%) were unmatched during reordering.
+
+--- pigz (gzip level 6, default) ---
+
+  Compression:
+    Wall time:        0.41 s
+    User time:       27.60 s
+    CPU utilization: 6,702%
+    Peak memory:       24 MB
+    Output size:   76,999,763 bytes (73.4 MB)
+    Ratio:         4.76x (vs raw FASTQ)
+
+  Decompression:
+    Wall time:        0.83 s
+    User time:        1.07 s
+    CPU utilization:   183%
+    Peak memory:        2 MB
+    Output size:  366,173,895 bytes (exact match)
+
+  Note: pigz is a parallel gzip. Decompression is mostly single-threaded (gzip format limitation).
+
+================================================================================
+ANALYSIS
+================================================================================
+
+Compression ratio:
+  QZ achieves 7.74x compression, beating SPRING (7.50x) by 3.2% and pigz (4.76x) by 62.5%.
+  QZ's advantage over SPRING comes from BSC/BWT on the full data without reordering overhead.
+  SPRING's reordering was largely ineffective on this dataset (91.7% unmatched reads).
+
+Speed:
+  QZ compresses 3.4x faster than SPRING (3.98s vs 13.65s).
+  QZ decompresses 2.7x faster than SPRING (2.56s vs 6.92s).
+  pigz is fastest (0.41s compress, 0.83s decompress) but at much worse compression.
+
+Memory:
+  QZ uses 1.8 GB peak during compression, 0.9 GB during decompression.
+  SPRING uses 3.2 GB peak during compression (1.8x more than QZ).
+  pigz uses negligible memory (24 MB).
+
+Order preservation:
+  QZ and pigz preserve original read order.
+  SPRING does NOT preserve read order (reorders for compression).

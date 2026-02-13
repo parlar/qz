@@ -17,11 +17,10 @@ use std::collections::HashMap;
 const NUM_BASES: usize = 5; // A, C, G, T, N
 const CONTEXT_ORDER: usize = 3; // Use previous 3 bases
 const NUM_POSITION_BINS: usize = 10;
-const NUM_GC_BINS: usize = 5; // 0-20%, 20-40%, 40-60%, 60-80%, 80-100%
 
 /// Context for DNA base prediction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SequenceContext {
+pub(crate) struct SequenceContext {
     prev_bases: u16,     // Packed representation of previous bases (up to 3 bases = 12 bits)
     position_bin: u8,    // 0-9 (position in read divided into bins)
 }
@@ -47,16 +46,6 @@ impl SequenceContext {
     }
 }
 
-/// Calculate GC bin for a sequence
-fn calculate_gc_bin(sequence: &str) -> u8 {
-    let gc_count = sequence
-        .bytes()
-        .filter(|&b| b == b'G' || b == b'C')
-        .count();
-    let gc_pct = (gc_count as f64 / sequence.len() as f64) * 100.0;
-    ((gc_pct / 20.0) as u8).min(NUM_GC_BINS as u8 - 1)
-}
-
 /// Adaptive sequence model with Markov-based prediction
 pub struct AdaptiveSequenceModel {
     /// Store frequency counts for each context: context_hash -> [count for each base]
@@ -73,7 +62,7 @@ impl AdaptiveSequenceModel {
     }
 
     /// Get probability distribution for a context
-    pub fn get_probabilities(&mut self, context: &SequenceContext) -> Vec<f64> {
+    pub(crate) fn get_probabilities(&mut self, context: &SequenceContext) -> Vec<f64> {
         let ctx_hash = context.hash();
         let counts = self
             .contexts
@@ -85,11 +74,14 @@ impl AdaptiveSequenceModel {
     }
 
     /// Update model after observing a symbol
-    pub fn update(&mut self, context: &SequenceContext, symbol: u8) {
+    pub(crate) fn update(&mut self, context: &SequenceContext, symbol: u8) {
         let ctx_hash = context.hash();
-        let counts = self.contexts.get_mut(&ctx_hash).unwrap();
+        let counts = self
+            .contexts
+            .entry(ctx_hash)
+            .or_insert_with(|| vec![10u32, 10, 10, 10, 1]);
 
-        counts[symbol as usize] += 4; // Faster learning for sequences
+        counts[(symbol as usize).min(NUM_BASES - 1)] += 4; // Faster learning for sequences
 
         // Rescale if needed
         let total: u32 = counts.iter().sum();
@@ -248,14 +240,6 @@ mod tests {
             ctx3.hash(),
             "Different positions should have different hashes"
         );
-    }
-
-    #[test]
-    fn test_gc_bin_calculation() {
-        assert_eq!(calculate_gc_bin("AAAAAAAAAA"), 0); // 0% GC
-        assert_eq!(calculate_gc_bin("ACGTACGTAC"), 2); // 50% GC
-        assert_eq!(calculate_gc_bin("GGGGGGGGGG"), 4); // 100% GC
-        assert_eq!(calculate_gc_bin("AAACCCGGGT"), 3); // 60% GC
     }
 
     #[test]

@@ -10,7 +10,6 @@
 
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read, Write};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 /// Write variable-length integer (same as in mod.rs)
 fn write_varint<W: Write>(writer: &mut W, mut value: usize) -> std::io::Result<()> {
@@ -199,7 +198,7 @@ pub fn encode_read_ids(read_ids: &[String], template: &ReadIdTemplate) -> Result
         // No template compression, just store raw IDs with length prefixes
         for id in read_ids {
             let bytes = id.as_bytes();
-            encoded.write_u16::<LittleEndian>(bytes.len() as u16)?;
+            encoded.write_all(&(bytes.len() as u16).to_le_bytes())?;
             encoded.write_all(bytes)?;
         }
         return Ok(encoded);
@@ -261,7 +260,7 @@ pub fn encode_read_ids(read_ids: &[String], template: &ReadIdTemplate) -> Result
     let use_packed = deltas.iter().all(|(dx, dy)| fits_in_2bits(*dx) && fits_in_2bits(*dy));
 
     // Write encoding flag (0 = varint, 1 = packed)
-    encoded.write_u8(if use_packed { 1 } else { 0 })?;
+    encoded.write_all(&[if use_packed { 1 } else { 0 }])?;
 
     if use_packed {
         // Pack deltas into 4 pairs per byte
@@ -281,11 +280,11 @@ pub fn encode_read_ids(read_ids: &[String], template: &ReadIdTemplate) -> Result
     if template.has_comment && template.common_comment.is_none() {
         for comment in comments {
             if let Some(comm) = comment {
-                encoded.write_u16::<LittleEndian>(comm.len() as u16)?;
+                encoded.write_all(&(comm.len() as u16).to_le_bytes())?;
                 encoded.write_all(comm.as_bytes())?;
             } else {
                 // No comment for this read, write length 0
-                encoded.write_u16::<LittleEndian>(0)?;
+                encoded.write_all(&0u16.to_le_bytes())?;
             }
         }
     }
@@ -305,7 +304,9 @@ pub fn decode_read_ids(
     if template.prefix.is_empty() {
         // No template compression, read raw IDs
         for _ in 0..num_reads {
-            let len = cursor.read_u16::<LittleEndian>()? as usize;
+            let mut len_buf = [0u8; 2];
+            cursor.read_exact(&mut len_buf)?;
+            let len = u16::from_le_bytes(len_buf) as usize;
             let mut bytes = vec![0u8; len];
             cursor.read_exact(&mut bytes)?;
             read_ids.push(String::from_utf8_lossy(&bytes).to_string());
@@ -314,7 +315,9 @@ pub fn decode_read_ids(
     }
 
     // Read encoding flag (0 = varint, 1 = packed)
-    let encoding_flag = cursor.read_u8()?;
+    let mut flag_buf = [0u8; 1];
+    cursor.read_exact(&mut flag_buf)?;
+    let encoding_flag = flag_buf[0];
     let use_packed = encoding_flag == 1;
 
     // Decode deltas
@@ -368,7 +371,9 @@ pub fn decode_read_ids(
                 format!("{} {}", base_id, common_comm)
             } else {
                 // Read per-read comment
-                let comment_len = cursor.read_u16::<LittleEndian>()? as usize;
+                let mut clen_buf = [0u8; 2];
+                cursor.read_exact(&mut clen_buf)?;
+                let comment_len = u16::from_le_bytes(clen_buf) as usize;
 
                 if comment_len > 0 {
                     let mut comment_bytes = vec![0u8; comment_len];

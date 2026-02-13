@@ -75,6 +75,7 @@ pub fn encode_paired_differences(r1_sequences: &[String], r2_sequences: &[String
 }
 
 /// Decode R2 sequences from R1 and difference data
+#[cfg(test)]
 pub fn decode_paired_differences(
     r1_sequences: &[String],
     diff_counts: &[u16],

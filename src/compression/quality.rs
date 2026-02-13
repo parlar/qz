@@ -1,4 +1,5 @@
 use crate::cli::QualityMode;
+use std::borrow::Cow;
 use tracing::info;
 
 /// Illumina 8-level binning table
@@ -16,20 +17,20 @@ const ILLUMINA_BINS: [u8; 94] = [
 ];
 
 /// Quantize quality string based on mode
-pub fn quantize_quality(quality: &str, mode: QualityMode) -> String {
+pub fn quantize_quality<'a>(quality: &'a str, mode: QualityMode) -> Cow<'a, str> {
     match mode {
-        QualityMode::Lossless => quality.to_string(),
-        QualityMode::IlluminaBin => quantize_illumina(quality),
-        QualityMode::Illumina4 => quantize_four_level(quality),
-        QualityMode::Binary => quantize_binary(quality, 20, 40, 6),
+        QualityMode::Lossless => Cow::Borrowed(quality),
+        QualityMode::IlluminaBin => Cow::Owned(quantize_illumina(quality)),
+        QualityMode::Illumina4 => Cow::Owned(quantize_four_level(quality)),
+        QualityMode::Binary => Cow::Owned(quantize_binary(quality, 20, 40, 6)),
         QualityMode::Qvz => {
             // TODO: Implement QVZ compression
             info!("QVZ mode not yet implemented, using lossless");
-            quality.to_string()
+            Cow::Borrowed(quality)
         }
         QualityMode::Discard => {
             // Discard quality: replace all with minimum quality '!'
-            "!".repeat(quality.len())
+            Cow::Owned("!".repeat(quality.len()))
         }
     }
 }

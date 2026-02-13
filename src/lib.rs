@@ -1,6 +1,5 @@
-// Library interface for fqz
+// Library interface for qz
 
 pub mod cli;
 pub mod compression;
-pub mod encoding;
 pub mod io;

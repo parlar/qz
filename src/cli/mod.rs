@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "fqz")]
-#[command(author = "FQZ Contributors")]
+#[command(name = "qz")]
+#[command(author = "QZ Contributors")]
 #[command(version = "0.1.0")]
 #[command(about = "Columnar FASTQ compression using BSC/BWT encoding", long_about = None)]
 pub struct Cli {
@@ -15,10 +15,16 @@ pub struct Cli {
 pub enum Commands {
     /// Compress FASTQ files
     Compress(CompressArgs),
-    /// Decompress FQZ archives
+    /// Decompress QZ archives
     Decompress(DecompressArgs),
-    /// Benchmark all compression strategies on each FASTQ stream (headers, sequences, qualities)
-    Benchmark(BenchmarkArgs),
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+pub enum ReorderMode {
+    /// Sort within each 5M-record chunk (fast, bounded memory, local ordering only)
+    Local,
+    /// Two-pass bucket sort across entire file (better ordering, bounded memory)
+    Global,
 }
 
 #[derive(Parser)]
@@ -27,7 +33,7 @@ pub struct CompressArgs {
     #[arg(short, long, value_name = "FILE", required = true)]
     pub input: Vec<PathBuf>,
 
-    /// Output FQZ archive file
+    /// Output QZ archive file
     #[arg(short, long, value_name = "FILE", required = true)]
     pub output: PathBuf,
 
@@ -35,32 +41,13 @@ pub struct CompressArgs {
     #[arg(short, long, default_value = ".")]
     pub working_dir: PathBuf,
 
-    /// Number of threads (default: number of CPU cores)
-    #[arg(short = 't', long, default_value_t = num_cpus())]
-    pub num_threads: usize,
-
-    /// Enable read reordering for better compression (experimental, may have patent implications)
-    #[arg(long)]
-    pub allow_reordering: bool,
-
-    /// Patent-safe read reordering strategy for better compression.
-    /// Flowcell: Sort by tile/X/Y coordinates (best for quality correlation).
-    /// GC: Sort by GC content bins. Length: Sort by read length.
-    /// Lexicographic: Alphabetical sort. Smart: Multi-level metadata sort.
-    #[arg(long, value_enum, default_value = "none")]
-    pub reorder_by: ReorderMode,
+    /// Number of threads (0 = auto-detect, default: auto)
+    #[arg(short = 't', long, default_value = "0")]
+    pub threads: usize,
 
     /// Do not preserve quality values
     #[arg(long)]
     pub no_quality: bool,
-
-    /// Do not preserve read IDs
-    #[arg(long)]
-    pub no_ids: bool,
-
-    /// Enable long read mode (for reads > 511 bases)
-    #[arg(long)]
-    pub long_mode: bool,
 
     /// Input files are gzipped FASTQ
     #[arg(short, long)]
@@ -90,10 +77,6 @@ pub struct CompressArgs {
     #[arg(long)]
     pub quality_delta: bool,
 
-    /// DEPRECATED: BSC is now the default compressor (kept for backward compatibility)
-    #[arg(long, hide = true)]
-    pub use_zstd: bool,
-
     /// Enable zstd dictionary training (only used with --quality-compressor zstd).
     /// WARNING: Only beneficial for very large datasets (>1M reads) or multi-file scenarios.
     /// The dictionary overhead (64KB+) outweighs gains for typical single-file compression.
@@ -108,17 +91,9 @@ pub struct CompressArgs {
     #[arg(long, short = 'l', default_value = "3", hide = true)]
     pub compression_level: i32,
 
-    /// Number of threads to use (0 = auto-detect). Parallelizes stream compression.
-    #[arg(long, short = 'j', default_value = "0")]
-    pub threads: usize,
-
     /// Enable arithmetic coding for sequences and qualities (experimental, 6-8x compression)
     #[arg(long)]
     pub arithmetic: bool,
-
-    /// Enable k-mer reference compression for sequences (6-8x compression, patent-safe)
-    #[arg(long)]
-    pub kmer_reference: bool,
 
     /// Enable de Bruijn graph compression for sequences (patent-safe, RC-aware)
     #[arg(long)]
@@ -147,11 +122,84 @@ pub struct CompressArgs {
     /// Use chunked streaming mode for lower memory usage (reads in 5M-record chunks with pipelined I/O)
     #[arg(long)]
     pub chunked: bool,
+
+    /// Use 2-bit sequence encoding (4 bases per byte + N-mask bitmap, may improve compression ratio)
+    #[arg(long)]
+    pub twobit: bool,
+
+    /// Use template-based header encoding (extracts common prefix, delta-encodes coordinates)
+    #[arg(long)]
+    pub header_template: bool,
+
+    /// Reorder reads by content similarity for better compression (destroys original read order).
+    /// Modes: 'local' = sort within 5M-record chunks (fast, bounded memory);
+    /// 'global' = two-pass bucket sort across entire file (better ordering, bounded memory).
+    #[arg(long, value_enum)]
+    pub reorder: Option<ReorderMode>,
+
+    /// Reverse-complement canonicalization: store each read as the lexicographically smaller
+    /// of {read, revcomp(read)} plus a 1-bit strand flag. Doubles effective k-mer overlap
+    /// for BWT compression without reordering.
+    #[arg(long)]
+    pub rc_canon: bool,
+
+    /// Prepend a syncmer-derived hint byte before each read's sequence to aid BWT clustering.
+    /// Preserves read order while giving BSC's BWT a grouping signal for similar reads.
+    #[arg(long)]
+    pub sequence_hints: bool,
+
+    /// Inline delta encoding: encode reads as deltas against cached similar reads.
+    /// Keeps everything in one BSC block; matching bases become 0x00 for better BWT compression.
+    #[arg(long)]
+    pub sequence_delta: bool,
+
+    /// Factorized sequence compression: two-pass inverted-index delta encoding
+    /// with separate metadata stream. Uses syncmer-based matching within each chunk
+    /// to find similar reads and encode them as deltas, without reordering.
+    #[arg(long)]
+    pub factorize: bool,
+}
+
+impl Default for CompressArgs {
+    fn default() -> Self {
+        Self {
+            input: Vec::new(),
+            output: PathBuf::new(),
+            working_dir: PathBuf::from("."),
+            threads: 0,
+            no_quality: false,
+            gzipped: false,
+            fasta: false,
+            quality_mode: QualityMode::Lossless,
+            delta_encoding: false,
+            rle_encoding: false,
+            quality_modeling: false,
+            quality_delta: false,
+            dict_training: false,
+            dict_size: 64,
+            compression_level: 3,
+            arithmetic: false,
+            debruijn: false,
+            kmer_size: 0,
+            quality_compressor: QualityCompressor::Bsc,
+            sequence_compressor: SequenceCompressor::Bsc,
+            header_compressor: HeaderCompressor::Bsc,
+            bsc_static: false,
+            chunked: false,
+            twobit: false,
+            header_template: false,
+            rc_canon: false,
+            reorder: None,
+            sequence_hints: false,
+            sequence_delta: false,
+            factorize: false,
+        }
+    }
 }
 
 #[derive(Parser)]
 pub struct DecompressArgs {
-    /// Input FQZ archive
+    /// Input QZ archive
     #[arg(short, long, value_name = "FILE", required = true)]
     pub input: PathBuf,
 
@@ -175,28 +223,6 @@ pub struct DecompressArgs {
     #[arg(long, default_value = "6")]
     pub gzip_level: u32,
 
-    /// Decompress only reads in range [start, end]
-    #[arg(long, value_names = ["START", "END"], num_args = 2)]
-    pub range: Option<Vec<u64>>,
-}
-
-#[derive(Parser)]
-pub struct BenchmarkArgs {
-    /// Input FASTQ file to benchmark against
-    #[arg(short, long, value_name = "FILE", required = true)]
-    pub input: PathBuf,
-
-    /// Input file is gzipped FASTQ
-    #[arg(short, long)]
-    pub gzipped: bool,
-
-    /// Maximum number of reads to load (default: all)
-    #[arg(long)]
-    pub max_reads: Option<usize>,
-
-    /// Only benchmark a specific stream (headers, sequences, qualities)
-    #[arg(long)]
-    pub stream: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -216,27 +242,16 @@ pub enum QualityMode {
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
-pub enum ReorderMode {
-    /// No reordering (preserve input order)
-    None,
-    /// Sort by flowcell tile/X/Y coordinates (patent-safe, best for quality correlation)
-    Flowcell,
-    /// Sort by GC content percentage (patent-safe)
-    Gc,
-    /// Sort by read length (patent-safe)
-    Length,
-    /// Sort alphabetically by sequence (patent-safe)
-    Lexicographic,
-    /// Multi-level metadata sort: flowcell + GC + length (patent-safe)
-    Smart,
-}
-
-#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 pub enum QualityCompressor {
     /// Legacy zstd (faster, ~20% larger)
     Zstd,
     /// BSC/BWT (best compression, default)
     Bsc,
+    /// OpenZL format-aware compression (Meta)
+    #[value(name = "openzl")]
+    OpenZl,
+    /// fqzcomp context-modeled compression with mean-quality reordering (~8% smaller than BSC)
+    Fqzcomp,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -245,6 +260,9 @@ pub enum SequenceCompressor {
     Zstd,
     /// BSC on raw ASCII sequences (best compression, default)
     Bsc,
+    /// OpenZL format-aware compression (Meta)
+    #[value(name = "openzl")]
+    OpenZl,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -253,6 +271,9 @@ pub enum HeaderCompressor {
     Zstd,
     /// BSC on raw headers (best compression, default)
     Bsc,
+    /// OpenZL format-aware compression (Meta)
+    #[value(name = "openzl")]
+    OpenZl,
 }
 
 fn num_cpus() -> usize {

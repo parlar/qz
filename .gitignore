@@ -15,7 +15,7 @@ cmake-build-*/
 
 # Test data and outputs
 test_data/
-*.fqz
+*.qz
 decompressed*.fastq
 test_*_decompressed.fastq
 
@@ -29,3 +29,6 @@ real_data/
 # Third-party tools
 third_party/
 ideas/
+# pixi environments
+.pixi/*
+!.pixi/config.toml

@@ -111,16 +111,39 @@ impl<R: BufRead> FastqReader<R> {
             return Ok(Some(FastqRecord::new(id, sequence, None)));
         }
 
-        // Read comment line ('+')
+        // Read and validate separator line ('+')
         self.buffer.clear();
-        self.reader.read_line(&mut self.buffer)
+        let sep_bytes = self.reader.read_line(&mut self.buffer)
             .context("Invalid FASTQ: missing '+' line")?;
+        if sep_bytes == 0 {
+            anyhow::bail!("Invalid FASTQ: unexpected EOF at '+' separator line");
+        }
+        let separator = self.buffer.trim_end();
+        if !separator.starts_with('+') {
+            anyhow::bail!(
+                "Invalid FASTQ: expected '+' separator line, got {:?}",
+                separator
+            );
+        }
 
         // Read quality line
         self.buffer.clear();
-        self.reader.read_line(&mut self.buffer)
+        let qual_bytes = self.reader.read_line(&mut self.buffer)
             .context("Invalid FASTQ: missing quality line")?;
+        if qual_bytes == 0 {
+            anyhow::bail!("Invalid FASTQ: unexpected EOF at quality line");
+        }
         let quality = self.buffer.trim_end().to_string();
+
+        // Validate sequence and quality lengths match
+        if quality.len() != sequence.len() {
+            anyhow::bail!(
+                "Invalid FASTQ: sequence length ({}) != quality length ({}) for read {}",
+                sequence.len(),
+                quality.len(),
+                id
+            );
+        }
 
         Ok(Some(FastqRecord::new(id, sequence, Some(quality))))
     }
@@ -146,5 +169,43 @@ mod tests {
         let record2 = reader.next().unwrap().unwrap();
         assert_eq!(record2.id, "@read2");
         assert!(reader.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_invalid_separator() {
+        let data = b"@read1\nACGT\nBAD_LINE\nIIII\n";
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        let result = reader.next();
+        assert!(result.is_err(), "Should reject FASTQ with invalid '+' separator");
+    }
+
+    #[test]
+    fn test_length_mismatch() {
+        let data = b"@read1\nACGT\n+\nIII\n"; // quality shorter than sequence
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        let result = reader.next();
+        assert!(result.is_err(), "Should reject FASTQ with mismatched lengths");
+    }
+
+    #[test]
+    fn test_empty_file() {
+        let data = b"";
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        assert!(reader.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_fasta_parsing() {
+        let data = b">seq1\nACGT\n>seq2\nTGCA\n";
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, true);
+
+        let record1 = reader.next().unwrap().unwrap();
+        assert_eq!(record1.id, ">seq1");
+        assert_eq!(record1.sequence, "ACGT");
+        assert!(record1.quality.is_none());
     }
 }

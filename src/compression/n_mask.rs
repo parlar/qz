@@ -92,8 +92,8 @@ pub fn decode_with_n_mask(encoding: &NMaskEncoding) -> String {
 }
 
 /// Analyze N-base statistics for a sequence
-#[allow(dead_code)]
-pub fn analyze_n_bases(seq: &str) -> NBaseStats {
+#[cfg(test)]
+fn analyze_n_bases(seq: &str) -> NBaseStats {
     let mut n_count = 0;
     let mut n_positions = Vec::new();
 
@@ -105,7 +105,6 @@ pub fn analyze_n_bases(seq: &str) -> NBaseStats {
     }
 
     NBaseStats {
-        total_bases: seq.len(),
         n_count,
         n_positions,
         n_percentage: if seq.is_empty() {
@@ -116,13 +115,12 @@ pub fn analyze_n_bases(seq: &str) -> NBaseStats {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct NBaseStats {
-    pub total_bases: usize,
-    pub n_count: usize,
-    pub n_positions: Vec<usize>,
-    pub n_percentage: f64,
+struct NBaseStats {
+    n_count: usize,
+    n_positions: Vec<usize>,
+    n_percentage: f64,
 }
 
 #[cfg(test)]

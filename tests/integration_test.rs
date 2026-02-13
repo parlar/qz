@@ -1,86 +1,53 @@
-use fqz::cli::{CompressArgs, DecompressArgs, HeaderCompressor, QualityCompressor, QualityMode, ReorderMode, SequenceCompressor};
+use qz::cli::{CompressArgs, DecompressArgs, HeaderCompressor, QualityCompressor, QualityMode, ReorderMode, SequenceCompressor};
 use std::fs;
 use tempfile::TempDir;
 
+/// Helper to create default DecompressArgs
+fn decompress_args(input: std::path::PathBuf, output: std::path::PathBuf, working_dir: std::path::PathBuf) -> DecompressArgs {
+    DecompressArgs {
+        input,
+        output: vec![output],
+        working_dir,
+        num_threads: 1,
+        gzipped: false,
+        gzip_level: 6,
+    }
+}
+
 #[test]
 fn test_compress_decompress_roundtrip() {
-    // Create temporary directory for test files
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Create a small test FASTQ file
     let input_fastq = temp_path.join("test_input.fastq");
     let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n@read2\nTGCATGCA\n+\nHHHHHHHH\n";
     fs::write(&input_fastq, test_data).unwrap();
 
-    // Compress the file
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
 
-    fqz::compression::compress(&compress_args).unwrap();
-
-    // Verify archive was created
+    qz::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Decompress the archive
     let output_fastq = temp_path.join("decompressed.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path.clone(),
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path.clone(),
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
 
-    fqz::compression::decompress(&decompress_args).unwrap();
-
-    // Verify decompressed file exists
     assert!(output_fastq.exists());
 
-    // Compare original and decompressed content
     let original = fs::read_to_string(&input_fastq).unwrap();
     let decompressed = fs::read_to_string(&output_fastq).unwrap();
 
-    // Parse both files into records for comparison
     let original_lines: Vec<&str> = original.lines().collect();
     let decompressed_lines: Vec<&str> = decompressed.lines().collect();
 
     assert_eq!(original_lines.len(), decompressed_lines.len());
 
-    // Compare each record (allowing for whitespace differences)
     for (orig, decomp) in original_lines.iter().zip(decompressed_lines.iter()) {
         assert_eq!(orig.trim(), decomp.trim());
     }
@@ -91,64 +58,33 @@ fn test_decompress_gzipped_output() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Create test FASTQ
     let input_fastq = temp_path.join("test_input.fastq");
     let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n";
     fs::write(&input_fastq, test_data).unwrap();
 
-    // Compress
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
 
-    // Decompress to gzipped output
     let output_fastq = temp_path.join("decompressed.fastq.gz");
-    let decompress_args = DecompressArgs {
+    let d_args = DecompressArgs {
         input: archive_path,
         output: vec![output_fastq.clone()],
         working_dir: temp_path,
         num_threads: 1,
         gzipped: true,
         gzip_level: 6,
-        range: None,
     };
-    fqz::compression::decompress(&decompress_args).unwrap();
+    qz::compression::decompress(&d_args).unwrap();
 
-    // Verify gzipped file was created
     assert!(output_fastq.exists());
 
-    // Verify it's a valid gzip file by checking magic bytes
     let data = fs::read(&output_fastq).unwrap();
     assert!(data.len() >= 2);
     assert_eq!(data[0], 0x1f);
@@ -160,64 +96,31 @@ fn test_decompress_no_quality() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Create test FASTQ
     let input_fastq = temp_path.join("test_input.fastq");
     let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n";
     fs::write(&input_fastq, test_data).unwrap();
 
-    // Compress without quality — use Zstd since BSC needs minimum data size
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: true,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
+        no_quality: true,
         quality_compressor: QualityCompressor::Zstd,
         sequence_compressor: SequenceCompressor::Zstd,
         header_compressor: HeaderCompressor::Zstd,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
 
-    // Decompress
     let output_fastq = temp_path.join("decompressed.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path,
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args).unwrap();
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
 
-    // Verify decompressed file has dummy quality values
     let content = fs::read_to_string(&output_fastq).unwrap();
     assert!(content.contains("IIIIIIII")); // Dummy quality
 }
+
 // ========================================
 // ERROR HANDLING TESTS
 // ========================================
@@ -227,47 +130,20 @@ fn test_empty_file() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Create empty FASTQ file
     let input_fastq = temp_path.join("empty.fastq");
     fs::write(&input_fastq, "").unwrap();
 
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
 
     // Should handle empty file gracefully (either error or create empty archive)
-    let result = fqz::compression::compress(&compress_args);
-    // Accept either success with empty archive or specific error
+    let result = qz::compression::compress(&compress_args);
     if result.is_ok() {
         assert!(archive_path.exists());
     }
@@ -278,59 +154,23 @@ fn test_single_read() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Single read
     let input_fastq = temp_path.join("single.fastq");
     fs::write(&input_fastq, "@read1\nACGT\n+\nIIII\n").unwrap();
 
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
 
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Decompress and verify
     let output_fastq = temp_path.join("output.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path,
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args).unwrap();
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
 
     let content = fs::read_to_string(&output_fastq).unwrap();
     assert!(content.contains("read1"));
@@ -342,63 +182,27 @@ fn test_long_read() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Create a very long read (1000bp)
     let long_seq = "ACGT".repeat(250);
     let long_qual = "I".repeat(1000);
     let fastq_data = format!("@long_read\n{}\n+\n{}\n", long_seq, long_qual);
-    
+
     let input_fastq = temp_path.join("long.fastq");
     fs::write(&input_fastq, fastq_data).unwrap();
 
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: true,  // Enable long read mode
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
 
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Decompress and verify
     let output_fastq = temp_path.join("output.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path,
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args).unwrap();
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
 
     let content = fs::read_to_string(&output_fastq).unwrap();
     assert!(content.contains(&long_seq));
@@ -409,63 +213,27 @@ fn test_reads_with_n_bases() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
 
-    // Reads with N bases
     let test_data = "@read1\nACGTNNNNACGT\n+\nIIII####IIII\n@read2\nNNNNNNNN\n+\n########\n";
     let input_fastq = temp_path.join("with_n.fastq");
     fs::write(&input_fastq, test_data).unwrap();
 
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
 
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Decompress and verify N bases preserved
     let output_fastq = temp_path.join("output.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path,
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args).unwrap();
-    
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
     let content = fs::read_to_string(&output_fastq).unwrap();
-    assert!(content.contains("ACGTNNNNA"));  // N bases should be preserved
+    assert!(content.contains("ACGTNNNNA")); // N bases should be preserved
 }
 
 // ========================================
@@ -481,57 +249,22 @@ fn test_illumina_binning_roundtrip() {
     let input_fastq = temp_path.join("test.fastq");
     fs::write(&input_fastq, test_data).unwrap();
 
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::IlluminaBin,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        quality_mode: QualityMode::IlluminaBin,
+        ..CompressArgs::default()
     };
 
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Decompress
     let output_fastq = temp_path.join("output.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path,
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args).unwrap();
-    
-    // Verify file exists (quality may differ due to binning)
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
     assert!(output_fastq.exists());
     let content = fs::read_to_string(&output_fastq).unwrap();
     assert!(content.contains("ACGTACGT"));
@@ -546,57 +279,22 @@ fn test_binary_quality_roundtrip() {
     let input_fastq = temp_path.join("test.fastq");
     fs::write(&input_fastq, test_data).unwrap();
 
-    let archive_path = temp_path.join("test.fqz");
+    let archive_path = temp_path.join("test.qz");
     let compress_args = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Binary,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        quality_mode: QualityMode::Binary,
+        ..CompressArgs::default()
     };
 
-    fqz::compression::compress(&compress_args).unwrap();
+    qz::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Decompress
     let output_fastq = temp_path.join("output.fastq");
-    let decompress_args = DecompressArgs {
-        input: archive_path,
-        output: vec![output_fastq.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args).unwrap();
-    
-    // Verify file exists
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
     assert!(output_fastq.exists());
 }
 
@@ -617,50 +315,23 @@ fn test_different_compression_levels() {
     let mut sizes = Vec::new();
 
     for level in levels {
-        let archive_path = temp_path.join(format!("test_level_{}.fqz", level));
+        let archive_path = temp_path.join(format!("test_level_{}.qz", level));
         let compress_args = CompressArgs {
             input: vec![input_fastq.clone()],
             output: archive_path.clone(),
             working_dir: temp_path.clone(),
-            num_threads: 1,
-            allow_reordering: false,
-            no_quality: false,
-            no_ids: false,
-            long_mode: false,
-            gzipped: false,
-            fasta: false,
-            quality_mode: QualityMode::Lossless,
-            delta_encoding: false,
-            rle_encoding: false,
-            quality_modeling: false,
-            quality_delta: false,
-            dict_training: false,
-            dict_size: 64,
-            compression_level: level,
             threads: 1,
-            use_zstd: false,
-            reorder_by: ReorderMode::None,
-            arithmetic: false,
-            kmer_reference: false,
-            debruijn: false,
-            kmer_size: 20,
-            quality_compressor: QualityCompressor::Bsc,
-            sequence_compressor: SequenceCompressor::Bsc,
-            header_compressor: HeaderCompressor::Bsc,
-            bsc_static: false,
-            chunked: false,
+            compression_level: level,
+            ..CompressArgs::default()
         };
 
-        fqz::compression::compress(&compress_args).unwrap();
+        qz::compression::compress(&compress_args).unwrap();
         let size = fs::metadata(&archive_path).unwrap().len();
         sizes.push((level, size));
     }
 
-    // Verify all succeeded
     assert_eq!(sizes.len(), 4);
-    
-    // Generally higher levels should produce smaller or equal files
-    // (though not guaranteed on small files)
+
     for (level, size) in &sizes {
         println!("Level {}: {} bytes", level, size);
     }
@@ -680,105 +351,638 @@ fn test_multithreading_deterministic() {
     fs::write(&input_fastq, &test_data).unwrap();
 
     // Compress with 1 thread
-    let archive1 = temp_path.join("test1.fqz");
+    let archive1 = temp_path.join("test1.qz");
     let compress_args1 = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive1.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 1,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
-    fqz::compression::compress(&compress_args1).unwrap();
+    qz::compression::compress(&compress_args1).unwrap();
 
     // Compress with 4 threads
-    let archive2 = temp_path.join("test2.fqz");
+    let archive2 = temp_path.join("test2.qz");
     let compress_args2 = CompressArgs {
         input: vec![input_fastq.clone()],
         output: archive2.clone(),
         working_dir: temp_path.clone(),
-        num_threads: 1,
-        allow_reordering: false,
-        no_quality: false,
-        no_ids: false,
-        long_mode: false,
-        gzipped: false,
-        fasta: false,
-        quality_mode: QualityMode::Lossless,
-        delta_encoding: false,
-        rle_encoding: false,
-        quality_modeling: false,
-        quality_delta: false,
-        dict_training: false,
-        dict_size: 64,
-        compression_level: 3,
         threads: 4,
-        use_zstd: false,
-        reorder_by: ReorderMode::None,
-        arithmetic: false,
-        kmer_reference: false,
-        debruijn: false,
-        kmer_size: 20,
-        quality_compressor: QualityCompressor::Bsc,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::Bsc,
-        bsc_static: false,
-        chunked: false,
+        ..CompressArgs::default()
     };
-    fqz::compression::compress(&compress_args2).unwrap();
+    qz::compression::compress(&compress_args2).unwrap();
 
     // Decompress both
     let output1 = temp_path.join("output1.fastq");
     let output2 = temp_path.join("output2.fastq");
 
-    let decompress_args1 = DecompressArgs {
-        input: archive1,
-        output: vec![output1.clone()],
-        working_dir: temp_path.clone(),
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args1).unwrap();
-
-    let decompress_args2 = DecompressArgs {
-        input: archive2,
-        output: vec![output2.clone()],
-        working_dir: temp_path,
-        num_threads: 1,
-        gzipped: false,
-        gzip_level: 6,
-        range: None,
-    };
-    fqz::compression::decompress(&decompress_args2).unwrap();
+    qz::compression::decompress(&decompress_args(archive1, output1.clone(), temp_path.clone())).unwrap();
+    qz::compression::decompress(&decompress_args(archive2, output2.clone(), temp_path)).unwrap();
 
     // Both should produce identical output
     let content1 = fs::read_to_string(&output1).unwrap();
     let content2 = fs::read_to_string(&output2).unwrap();
     assert_eq!(content1, content2, "Multi-threaded compression should produce same output as single-threaded");
+}
+
+// ========== ERROR HANDLING TESTS ==========
+
+#[test]
+fn test_decompress_truncated_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    // Create a valid archive
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n@read2\nTGCATGCA\n+\nHHHHHHHH\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        ..CompressArgs::default()
+    };
+    qz::compression::compress(&compress_args).unwrap();
+
+    // Truncate to half size
+    let archive_data = fs::read(&archive_path).unwrap();
+    let truncated_path = temp_path.join("truncated.qz");
+    fs::write(&truncated_path, &archive_data[..archive_data.len() / 2]).unwrap();
+
+    let output_fastq = temp_path.join("output.fastq");
+    let result = qz::compression::decompress(&decompress_args(
+        truncated_path, output_fastq, temp_path,
+    ));
+    assert!(result.is_err(), "Decompressing a truncated archive should fail");
+}
+
+#[test]
+fn test_decompress_corrupted_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    // Create a valid archive
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n@read2\nTGCATGCA\n+\nHHHHHHHH\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        ..CompressArgs::default()
+    };
+    qz::compression::compress(&compress_args).unwrap();
+
+    // Corrupt bytes in the data section
+    let mut archive_data = fs::read(&archive_path).unwrap();
+    let mid = archive_data.len() / 2;
+    for i in mid..std::cmp::min(mid + 32, archive_data.len()) {
+        archive_data[i] ^= 0xFF;
+    }
+    let corrupted_path = temp_path.join("corrupted.qz");
+    fs::write(&corrupted_path, &archive_data).unwrap();
+
+    let output_fastq = temp_path.join("output.fastq");
+    let result = qz::compression::decompress(&decompress_args(
+        corrupted_path, output_fastq, temp_path,
+    ));
+    assert!(result.is_err(), "Decompressing a corrupted archive should fail");
+}
+
+#[test]
+fn test_decompress_zero_byte_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let empty_archive = temp_path.join("empty.qz");
+    fs::write(&empty_archive, b"").unwrap();
+
+    let output_fastq = temp_path.join("output.fastq");
+    let result = qz::compression::decompress(&decompress_args(
+        empty_archive, output_fastq, temp_path,
+    ));
+    assert!(result.is_err(), "Decompressing a zero-byte file should fail");
+}
+
+#[test]
+fn test_twobit_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "@read1\nACGTACGTNNACGT\n+\nIIIIIIIIIIIIII\n@read2\nTGCATGCAATGCAT\n+\nHHHHHHHHHHHHHH\n@read3\nNNNACGTACGTNNN\n+\nAAAAAAAAAAAABB\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        twobit: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+    assert_eq!(original.trim(), decompressed.trim());
+}
+
+#[test]
+fn test_header_template_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Illumina-style headers with common prefix and varying coordinates
+    let test_data = "@INSTRUMENT:123:FLOWCELL:1:2101:1000:2000 1:N:0:ATCG\nACGTACGT\n+\nIIIIIIII\n\
+                     @INSTRUMENT:123:FLOWCELL:1:2101:1001:2001 1:N:0:ATCG\nTGCATGCA\n+\nHHHHHHHH\n\
+                     @INSTRUMENT:123:FLOWCELL:1:2101:1002:2002 1:N:0:ATCG\nAAAACCCC\n+\nBBBBBBBB\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        header_template: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+    assert_eq!(original.trim(), decompressed.trim());
+}
+
+#[test]
+fn test_quality_modeling_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n@read2\nTGCATGCA\n+\nHHHHHHHH\n@read3\nAAAACCCC\n+\nBBBBAAAA\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        quality_modeling: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    // Quality modeling is lossy (i8 delta clamping), so check sequences match and qualities are close
+    let original_content = fs::read_to_string(&input_fastq).unwrap();
+    let original_lines: Vec<&str> = original_content.lines().collect();
+    let decompressed_content = fs::read_to_string(&output_fastq).unwrap();
+    let decompressed_lines: Vec<&str> = decompressed_content.lines().collect();
+
+    // Check same number of lines
+    assert_eq!(original_lines.len(), decompressed_lines.len());
+
+    // Check headers and sequences match exactly
+    for (i, (orig, decomp)) in original_lines.iter().zip(decompressed_lines.iter()).enumerate() {
+        let line_type = i % 4;
+        if line_type == 0 || line_type == 1 || line_type == 2 {
+            // Header, sequence, separator should match exactly
+            assert_eq!(orig.trim(), decomp.trim(), "Line {} mismatch", i);
+        }
+        // Quality lines may differ slightly due to modeling
+    }
+}
+
+#[test]
+fn test_openzl_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "@read1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@read2\nTGCATGCATGCATGCA\n+\nHHHHHHHHHHHHHHHH\n@read3\nAAAACCCCGGGGTTTT\n+\nFFFFFFFFFFFFFFFF\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        quality_compressor: QualityCompressor::OpenZl,
+        sequence_compressor: SequenceCompressor::OpenZl,
+        header_compressor: HeaderCompressor::OpenZl,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let original_lines: Vec<&str> = original.lines().collect();
+    let decompressed_lines: Vec<&str> = decompressed.lines().collect();
+
+    assert_eq!(original_lines.len(), decompressed_lines.len());
+
+    for (orig, decomp) in original_lines.iter().zip(decompressed_lines.iter()) {
+        assert_eq!(orig.trim(), decomp.trim());
+    }
+}
+
+#[test]
+fn test_fqzcomp_quality_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Multiple reads with varying quality profiles to test mean-quality sorting
+    let test_data = "@read1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n\
+                     @read2\nTGCATGCATGCATGCA\n+\n!!!!!!!!!!!!!!!!\n\
+                     @read3\nAAAACCCCGGGGTTTT\n+\nFFFFFFFFFFFFFFFF\n\
+                     @read4\nACGTTGCAACGTTGCA\n+\nHHHHAAAAHHHHAAAA\n\
+                     @read5\nGGGGCCCCAAAATTTT\n+\nBBBBBBBBBBBBBBBB\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        quality_compressor: QualityCompressor::Fqzcomp,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let original_lines: Vec<&str> = original.lines().collect();
+    let decompressed_lines: Vec<&str> = decompressed.lines().collect();
+
+    assert_eq!(original_lines.len(), decompressed_lines.len(),
+        "Line count mismatch: expected {}, got {}", original_lines.len(), decompressed_lines.len());
+
+    for (i, (orig, decomp)) in original_lines.iter().zip(decompressed_lines.iter()).enumerate() {
+        assert_eq!(orig.trim(), decomp.trim(),
+            "Line {} mismatch:\n  original:     {:?}\n  decompressed: {:?}", i, orig, decomp);
+    }
+}
+
+#[test]
+fn test_openzl_mixed_compressors() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "@read1\nACGTACGT\n+\nIIIIIIII\n@read2\nTGCATGCA\n+\nHHHHHHHH\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        quality_compressor: QualityCompressor::OpenZl,
+        sequence_compressor: SequenceCompressor::Bsc,
+        header_compressor: HeaderCompressor::OpenZl,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let original_lines: Vec<&str> = original.lines().collect();
+    let decompressed_lines: Vec<&str> = decompressed.lines().collect();
+
+    assert_eq!(original_lines.len(), decompressed_lines.len());
+
+    for (orig, decomp) in original_lines.iter().zip(decompressed_lines.iter()) {
+        assert_eq!(orig.trim(), decomp.trim());
+    }
+}
+
+#[test]
+fn test_reorder_local_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
+@read3\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+@read4\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        reorder: Some(ReorderMode::Local),
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    // With reorder, reads may be in a different order but all reads must be present
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len());
+
+    let mut orig_records: Vec<String> = orig_lines.chunks(4).map(|c| c.join("\n")).collect();
+    let mut decomp_records: Vec<String> = decomp_lines.chunks(4).map(|c| c.join("\n")).collect();
+    orig_records.sort();
+    decomp_records.sort();
+    assert_eq!(orig_records, decomp_records);
+}
+
+#[test]
+fn test_reorder_global_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
+@read3\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+@read4\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        reorder: Some(ReorderMode::Global),
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path.clone())).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len());
+
+    let mut orig_records: Vec<String> = orig_lines.chunks(4).map(|c| c.join("\n")).collect();
+    let mut decomp_records: Vec<String> = decomp_lines.chunks(4).map(|c| c.join("\n")).collect();
+    orig_records.sort();
+    decomp_records.sort();
+    assert_eq!(orig_records, decomp_records);
+}
+
+#[test]
+fn test_sequence_hints_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Reads >= 21bp for valid syncmers, plus one short read to test 0xFF fallback
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
+@read3\nAAAACCCCGGGGTTTTAAAACCCCGGGGTTTT\n+\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
+@read4\nACGT\n+\nIIII\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        sequence_hints: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    // Verify encoding_type byte is 4
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[0], 4, "encoding_type should be 4 for sequence hints");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len());
+    for (orig, decomp) in orig_lines.iter().zip(decomp_lines.iter()) {
+        assert_eq!(orig.trim(), decomp.trim());
+    }
+}
+
+#[test]
+fn test_sequence_delta_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Include near-duplicate reads to exercise delta path, plus a unique read
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
+@read3\nACGTACGTACGTACGTACGTACGTATGTACGT\n+\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
+@read4\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read5\nAAAACCCCGGGGTTTTAAAACCCCGGGGTTTT\n+\nDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\n\
+@read6\nACGT\n+\nIIII\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        sequence_delta: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    // Verify encoding_type byte is 5
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[0], 5, "encoding_type should be 5 for inline delta");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len());
+    for (orig, decomp) in orig_lines.iter().zip(decomp_lines.iter()) {
+        assert_eq!(orig.trim(), decomp.trim());
+    }
+}
+
+#[test]
+fn test_rc_canon_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("test.fastq");
+
+    // Create test data with reads that benefit from RC canonicalization
+    fs::write(&input_fastq,
+        "@read1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n\
+         @read2\nACGTACGTACGTACGT\n+\nFFFFFFFFFFFFFFFF\n\
+         @read3\nTTTTAAAACCCCGGGG\n+\nAAAAAAAAAAAAAAAA\n\
+         @read4\nCCCCGGGGTTTTAAAA\n+\nBBBBBBBBBBBBBBBB\n"
+    ).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        rc_canon: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    // Verify encoding_type byte is 6
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[0], 6, "encoding_type should be 6 for rc_canon");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
+    for (i, (orig, decomp)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
+        assert_eq!(orig.trim(), decomp.trim(), "mismatch at line {}", i);
+    }
+}
+
+#[test]
+fn test_factorize_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Include near-duplicate reads to exercise the factorize match path
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
+@read3\nACGTACGTACGTACGTACGTACGTATGTACGT\n+\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
+@read4\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read5\nAAAACCCCGGGGTTTTAAAACCCCGGGGTTTT\n+\nDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\n\
+@read6\nACGT\n+\nIIII\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        factorize: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    // Verify encoding_type byte is 7
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[0], 7, "encoding_type should be 7 for factorize");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
+    for (i, (orig, decomp)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
+        assert_eq!(orig.trim(), decomp.trim(), "mismatch at line {}", i);
+    }
 }

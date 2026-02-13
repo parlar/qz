@@ -2,27 +2,38 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use std::path::PathBuf;
 
-use crate::cli::{CompressArgs, DecompressArgs, QualityMode};
+use crate::cli::{
+    CompressArgs, DecompressArgs, HeaderCompressor, QualityCompressor, QualityMode,
+    SequenceCompressor,
+};
 use crate::compression;
 
-/// Compress a FASTQ file to COIL format
+/// Compress a FASTQ file to QZ format
 ///
 /// Args:
-///     input_file: Path to input FASTQ file (or list of 2 files for paired-end)
-///     output_file: Path to output COIL archive
+///     input_file: Path to input FASTQ file (str or list of str for paired-end)
+///     output_file: Path to output QZ archive
 ///     working_dir: Working directory for temporary files (default: ".")
-///     num_threads: Number of threads to use (default: auto)
+///     num_threads: Number of threads to use (0 = auto, default: auto)
 ///     no_quality: Do not preserve quality values (default: False)
-///     no_ids: Do not preserve read IDs (default: False)
-///     quality_mode: Quality compression mode - "lossless", "illumina-bin", or "binary" (default: "lossless")
+///     quality_mode: Quality mode - "lossless", "illumina-bin", "illumina4", "binary", "qvz", "discard" (default: "lossless")
 ///     gzipped: Input files are gzipped (default: False)
+///     fasta: Input is FASTA format (default: False)
+///     quality_compressor: Quality compressor - "bsc", "zstd", or "openzl" (default: "bsc")
+///     sequence_compressor: Sequence compressor - "bsc", "zstd", or "openzl" (default: "bsc")
+///     header_compressor: Header compressor - "bsc", "zstd", or "openzl" (default: "bsc")
+///     chunked: Use chunked streaming mode for lower memory (default: False)
+///     bsc_static: Use BSC static coder instead of adaptive (default: False)
+///     arithmetic: Enable arithmetic coding (experimental, default: False)
+///     debruijn: Enable de Bruijn graph compression (experimental, default: False)
 ///
 /// Returns:
 ///     None
 ///
 /// Example:
-///     >>> import coil
-///     >>> coil.compress("reads.fastq", "compressed.coil")
+///     >>> import qz
+///     >>> qz.compress("reads.fastq", "compressed.qz")
+///     >>> qz.compress(["R1.fastq", "R2.fastq"], "paired.qz")
 #[pyfunction]
 #[pyo3(signature = (
     input_file,
@@ -30,9 +41,16 @@ use crate::compression;
     working_dir = None,
     num_threads = None,
     no_quality = false,
-    no_ids = false,
     quality_mode = "lossless",
-    gzipped = false
+    gzipped = false,
+    fasta = false,
+    quality_compressor = "bsc",
+    sequence_compressor = "bsc",
+    header_compressor = "bsc",
+    chunked = false,
+    bsc_static = false,
+    arithmetic = false,
+    debruijn = false
 ))]
 fn compress(
     input_file: PathOrList,
@@ -40,58 +58,54 @@ fn compress(
     working_dir: Option<String>,
     num_threads: Option<usize>,
     no_quality: bool,
-    no_ids: bool,
     quality_mode: &str,
     gzipped: bool,
+    fasta: bool,
+    quality_compressor: &str,
+    sequence_compressor: &str,
+    header_compressor: &str,
+    chunked: bool,
+    bsc_static: bool,
+    arithmetic: bool,
+    debruijn: bool,
 ) -> PyResult<()> {
-    // Parse input files
     let input_paths = match input_file {
         PathOrList::Single(path) => vec![PathBuf::from(path)],
         PathOrList::List(paths) => paths.into_iter().map(PathBuf::from).collect(),
     };
 
-    // Parse quality mode
-    let qmode = match quality_mode {
-        "lossless" => QualityMode::Lossless,
-        "illumina-bin" => QualityMode::IlluminaBin,
-        "binary" => QualityMode::Binary,
-        "qvz" => QualityMode::Qvz,
-        _ => {
-            return Err(PyRuntimeError::new_err(format!(
-                "Invalid quality mode: {}. Must be one of: lossless, illumina-bin, binary, qvz",
-                quality_mode
-            )))
-        }
-    };
+    let qmode = parse_quality_mode(quality_mode)?;
+    let qcomp = parse_compressor::<QualityCompressor>(quality_compressor, "quality_compressor")?;
+    let scomp = parse_compressor::<SequenceCompressor>(sequence_compressor, "sequence_compressor")?;
+    let hcomp = parse_compressor::<HeaderCompressor>(header_compressor, "header_compressor")?;
 
     let args = CompressArgs {
         input: input_paths,
         output: PathBuf::from(output_file),
         working_dir: PathBuf::from(working_dir.unwrap_or_else(|| ".".to_string())),
-        num_threads: num_threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-        }),
-        allow_reordering: false,  // Not exposed in API for patent safety
+        threads: num_threads.unwrap_or(0),
         no_quality,
-        no_ids,
-        long_mode: false,
         gzipped,
-        fasta: false,
+        fasta,
         quality_mode: qmode,
-        delta_encoding: false,
-        rle_encoding: false,
+        quality_compressor: qcomp,
+        sequence_compressor: scomp,
+        header_compressor: hcomp,
+        chunked,
+        bsc_static,
+        arithmetic,
+        debruijn,
+        ..CompressArgs::default()
     };
 
-    compression::compress(&args).map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
+    compression::compress(&args).map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
 }
 
-/// Decompress a COIL archive to FASTQ format
+/// Decompress a QZ archive to FASTQ format
 ///
 /// Args:
-///     input_file: Path to input COIL archive
-///     output_file: Path to output FASTQ file (or list of 2 files for paired-end)
+///     input_file: Path to input QZ archive
+///     output_file: Path to output FASTQ file (str or list of str for paired-end)
 ///     working_dir: Working directory for temporary files (default: ".")
 ///     num_threads: Number of threads to use (default: auto)
 ///     gzipped: Output gzipped FASTQ (default: False)
@@ -101,10 +115,9 @@ fn compress(
 ///     None
 ///
 /// Example:
-///     >>> import coil
-///     >>> coil.decompress("compressed.coil", "reads.fastq")
-///     >>> # Decompress to gzipped output
-///     >>> coil.decompress("compressed.coil", "reads.fastq.gz", gzipped=True)
+///     >>> import qz
+///     >>> qz.decompress("compressed.qz", "reads.fastq")
+///     >>> qz.decompress("compressed.qz", "reads.fastq.gz", gzipped=True)
 #[pyfunction]
 #[pyo3(signature = (
     input_file,
@@ -122,7 +135,6 @@ fn decompress(
     gzipped: bool,
     gzip_level: u32,
 ) -> PyResult<()> {
-    // Parse output files
     let output_paths = match output_file {
         PathOrList::Single(path) => vec![PathBuf::from(path)],
         PathOrList::List(paths) => paths.into_iter().map(PathBuf::from).collect(),
@@ -139,10 +151,9 @@ fn decompress(
         }),
         gzipped,
         gzip_level,
-        range: None,
     };
 
-    compression::decompress(&args).map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
+    compression::decompress(&args).map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
 }
 
 /// Get version information
@@ -158,9 +169,71 @@ enum PathOrList {
     List(Vec<String>),
 }
 
+fn parse_quality_mode(mode: &str) -> PyResult<QualityMode> {
+    match mode {
+        "lossless" => Ok(QualityMode::Lossless),
+        "illumina-bin" => Ok(QualityMode::IlluminaBin),
+        "illumina4" => Ok(QualityMode::Illumina4),
+        "binary" => Ok(QualityMode::Binary),
+        "qvz" => Ok(QualityMode::Qvz),
+        "discard" => Ok(QualityMode::Discard),
+        _ => Err(PyRuntimeError::new_err(format!(
+            "Invalid quality mode: '{}'. Must be one of: lossless, illumina-bin, illumina4, binary, qvz, discard",
+            mode
+        ))),
+    }
+}
+
+fn parse_compressor<T: FromStrCompressor>(s: &str, param_name: &str) -> PyResult<T> {
+    T::from_str_py(s, param_name)
+}
+
+trait FromStrCompressor: Sized {
+    fn from_str_py(s: &str, param_name: &str) -> PyResult<Self>;
+}
+
+impl FromStrCompressor for QualityCompressor {
+    fn from_str_py(s: &str, param_name: &str) -> PyResult<Self> {
+        match s {
+            "bsc" => Ok(QualityCompressor::Bsc),
+            "zstd" => Ok(QualityCompressor::Zstd),
+            "openzl" => Ok(QualityCompressor::OpenZl),
+            _ => Err(PyRuntimeError::new_err(format!(
+                "Invalid {}: '{}'. Must be 'bsc', 'zstd', or 'openzl'", param_name, s
+            ))),
+        }
+    }
+}
+
+impl FromStrCompressor for SequenceCompressor {
+    fn from_str_py(s: &str, param_name: &str) -> PyResult<Self> {
+        match s {
+            "bsc" => Ok(SequenceCompressor::Bsc),
+            "zstd" => Ok(SequenceCompressor::Zstd),
+            "openzl" => Ok(SequenceCompressor::OpenZl),
+            _ => Err(PyRuntimeError::new_err(format!(
+                "Invalid {}: '{}'. Must be 'bsc', 'zstd', or 'openzl'", param_name, s
+            ))),
+        }
+    }
+}
+
+impl FromStrCompressor for HeaderCompressor {
+    fn from_str_py(s: &str, param_name: &str) -> PyResult<Self> {
+        match s {
+            "bsc" => Ok(HeaderCompressor::Bsc),
+            "zstd" => Ok(HeaderCompressor::Zstd),
+            "openzl" => Ok(HeaderCompressor::OpenZl),
+            _ => Err(PyRuntimeError::new_err(format!(
+                "Invalid {}: '{}'. Must be 'bsc', 'zstd', or 'openzl'", param_name, s
+            ))),
+        }
+    }
+}
+
 /// Python module definition
 #[pymodule]
-fn coil(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn qz(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compress, m)?)?;
     m.add_function(wrap_pyfunction!(decompress, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;

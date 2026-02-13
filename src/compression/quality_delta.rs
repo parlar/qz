@@ -109,16 +109,13 @@ pub fn unpack_deltas(packed: &[u8]) -> Vec<i8> {
 }
 
 /// Compute statistics on delta magnitudes
-#[allow(dead_code)]
 pub fn analyze_deltas(encoded: &[Vec<i8>]) -> DeltaStats {
-    let mut total_deltas = 0;
-    let mut zero_count = 0;
-    let mut small_count = 0; // |delta| <= 3
-    let mut large_count = 0; // |delta| > 10
+    let mut total_deltas = 0usize;
+    let mut zero_count = 0usize;
+    let mut small_count = 0usize;
     let mut max_delta = 0i8;
 
     for deltas in encoded.iter().skip(1) {
-        // Skip first (absolute values)
         for &delta in deltas {
             total_deltas += 1;
             let abs_delta = delta.abs();
@@ -127,8 +124,6 @@ pub fn analyze_deltas(encoded: &[Vec<i8>]) -> DeltaStats {
                 zero_count += 1;
             } else if abs_delta <= 3 {
                 small_count += 1;
-            } else if abs_delta > 10 {
-                large_count += 1;
             }
 
             if abs_delta > max_delta.abs() {
@@ -138,10 +133,6 @@ pub fn analyze_deltas(encoded: &[Vec<i8>]) -> DeltaStats {
     }
 
     DeltaStats {
-        total_deltas,
-        zero_count,
-        small_count,
-        large_count,
         max_delta,
         zero_percent: if total_deltas > 0 {
             (zero_count as f64 / total_deltas as f64) * 100.0
@@ -156,13 +147,7 @@ pub fn analyze_deltas(encoded: &[Vec<i8>]) -> DeltaStats {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
 pub struct DeltaStats {
-    pub total_deltas: usize,
-    pub zero_count: usize,
-    pub small_count: usize,
-    pub large_count: usize,
     pub max_delta: i8,
     pub zero_percent: f64,
     pub small_percent: f64,

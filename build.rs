@@ -29,6 +29,21 @@ fn main() {
 
     println!("cargo:rerun-if-changed=third_party/libbsc");
 
+    // Compile htscodecs (fqzcomp_qual + utils) as static C lib
+    cc::Build::new()
+        .files(&[
+            "third_party/htscodecs/htscodecs/fqzcomp_qual.c",
+            "third_party/htscodecs/htscodecs/utils.c",
+        ])
+        .flag_if_supported("-O3")
+        .include("third_party/htscodecs/htscodecs")
+        .warnings(false)
+        .compile("htscodecs");
+
+    println!("cargo:rerun-if-changed=third_party/htscodecs/htscodecs");
+
     // Link OpenMP for multithreading (if available)
     println!("cargo:rustc-link-lib=gomp"); // GNU OpenMP
+    // Link math lib for htscodecs (log, etc.)
+    println!("cargo:rustc-link-lib=m");
 }

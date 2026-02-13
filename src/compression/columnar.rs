@@ -7,13 +7,12 @@
 /// 4. No reordering required!
 
 use crate::io::FastqRecord;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::io::Write;
 use tracing::info;
 
 /// Quality binning schemes
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub enum QualityBinning {
     /// Illumina 8-level binning (3 bits per quality)
     Illumina8,
@@ -106,7 +105,7 @@ pub fn pack_qualities(qualities: &str, binning: QualityBinning) -> Vec<u8> {
     let bytes = qualities.as_bytes();
     let bits_per_qual = binning.bits_per_quality();
 
-    let mut packed = Vec::new();
+    let mut packed = Vec::with_capacity((bytes.len() * bits_per_qual + 7) / 8);
     let mut buffer = 0u64;
     let mut bits_in_buffer = 0;
 
@@ -162,7 +161,54 @@ pub fn unpack_qualities(packed: &[u8], length: usize, binning: QualityBinning) -
         bits_in_buffer = bits_in_buffer.saturating_sub(bits_per_qual);
     }
 
-    String::from_utf8_lossy(&qualities).to_string()
+    // SAFETY: all quality bytes are phred+33 (range 33-126), guaranteed valid ASCII/UTF-8
+    unsafe { String::from_utf8_unchecked(qualities) }
+}
+
+/// Unpack quality scores directly to a writer, avoiding intermediate String allocation
+pub fn unpack_qualities_to_writer<W: Write>(
+    packed: &[u8],
+    length: usize,
+    binning: QualityBinning,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let bits_per_qual = binning.bits_per_quality();
+    let mask = (1u64 << bits_per_qual) - 1;
+
+    let mut buffer = 0u64;
+    let mut bits_in_buffer = 0;
+    let mut packed_idx = 0;
+
+    // Process in chunks to reduce write syscalls
+    let mut out_buf = [0u8; 256];
+    let mut out_pos = 0;
+
+    for _ in 0..length {
+        while bits_in_buffer < bits_per_qual && packed_idx < packed.len() {
+            buffer |= (packed[packed_idx] as u64) << bits_in_buffer;
+            bits_in_buffer += 8;
+            packed_idx += 1;
+        }
+
+        let encoded = (buffer & mask) as u8;
+        let phred = binning.decode(encoded);
+        out_buf[out_pos] = phred + 33;
+        out_pos += 1;
+
+        if out_pos == 256 {
+            writer.write_all(&out_buf)?;
+            out_pos = 0;
+        }
+
+        buffer >>= bits_per_qual;
+        bits_in_buffer = bits_in_buffer.saturating_sub(bits_per_qual);
+    }
+
+    if out_pos > 0 {
+        writer.write_all(&out_buf[..out_pos])?;
+    }
+
+    Ok(())
 }
 
 /// Write variable-length integer
@@ -174,33 +220,9 @@ fn write_varint<W: Write>(writer: &mut W, mut value: usize) -> std::io::Result<(
     writer.write_all(&[value as u8])
 }
 
-/// Read variable-length integer
-fn read_varint(data: &[u8], offset: &mut usize) -> Option<usize> {
-    let mut value = 0usize;
-    let mut shift = 0;
-
-    loop {
-        if *offset >= data.len() {
-            return None;
-        }
-
-        let byte = data[*offset];
-        *offset += 1;
-
-        value |= ((byte & 0x7F) as usize) << shift;
-
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-
-        shift += 7;
-    }
-}
-
 /// Columnar compression statistics
 #[derive(Debug)]
 pub struct ColumnarStats {
-    #[allow(dead_code)]
     pub num_reads: usize,
     pub total_bases: usize,
     pub original_size: usize,
@@ -308,79 +330,9 @@ pub fn compress_columnar(
     Ok((headers_compressed, sequences_compressed, nmasks_compressed, qualities_compressed, stats))
 }
 
-/// Decompress columnar format back to FASTQ records
-pub fn decompress_columnar(
-    headers_compressed: &[u8],
-    sequences_compressed: &[u8],
-    nmasks_compressed: &[u8],
-    qualities_compressed: &[u8],
-    binning: QualityBinning,
-) -> Result<Vec<FastqRecord>> {
-    use crate::compression::n_mask::{decode_with_n_mask, NMaskEncoding};
-
-    // Decompress streams
-    let header_stream = decompress_stream(headers_compressed)?;
-    let sequence_stream = decompress_stream(sequences_compressed)?;
-    let nmask_stream = decompress_stream(nmasks_compressed)?;
-    let quality_stream = decompress_stream(qualities_compressed)?;
-
-    let mut records = Vec::new();
-    let mut h_offset = 0;
-    let mut s_offset = 0;
-    let mut n_offset = 0;
-    let mut q_offset = 0;
-
-    // Reconstruct records
-    while h_offset < header_stream.len() {
-        // Read header
-        let h_len = read_varint(&header_stream, &mut h_offset)
-            .context("Failed to read header length")?;
-        let id = String::from_utf8_lossy(&header_stream[h_offset..h_offset + h_len]).to_string();
-        h_offset += h_len;
-
-        // Read sequence with N-mask
-        let s_len = read_varint(&sequence_stream, &mut s_offset)
-            .context("Failed to read sequence length")?;
-        let s_encoded_len = (s_len + 3) / 4; // 4 bases per byte (2-bit)
-        let n_mask_len = (s_len + 7) / 8;     // 8 bases per byte (bitmap)
-
-        let encoding = NMaskEncoding {
-            sequence_2bit: sequence_stream[s_offset..s_offset + s_encoded_len].to_vec(),
-            n_mask: nmask_stream[n_offset..n_offset + n_mask_len].to_vec(),
-            length: s_len,
-        };
-        let sequence = decode_with_n_mask(&encoding);
-        s_offset += s_encoded_len;
-        n_offset += n_mask_len;
-
-        // Read quality
-        let quality = if q_offset < quality_stream.len() {
-            let q_len = read_varint(&quality_stream, &mut q_offset)
-                .context("Failed to read quality length")?;
-            let bits_per_qual = binning.bits_per_quality();
-            let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
-            let quality_str = unpack_qualities(&quality_stream[q_offset..q_offset + q_encoded_len], q_len, binning);
-            q_offset += q_encoded_len;
-            Some(quality_str)
-        } else {
-            None
-        };
-
-        records.push(FastqRecord::new(id, sequence, quality));
-    }
-
-    Ok(records)
-}
-
 /// Compress a byte stream with zstd at specified level
 fn compress_stream(data: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::bulk::compress(data, level)
         .map_err(|e| anyhow::anyhow!("Zstd compression failed: {}", e))
-}
-
-/// Decompress a zstd stream
-fn decompress_stream(compressed: &[u8]) -> Result<Vec<u8>> {
-    zstd::bulk::decompress(compressed, 100_000_000) // 100MB limit
-        .map_err(|e| anyhow::anyhow!("Zstd decompression failed: {}", e))
 }
 

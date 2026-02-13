@@ -10,7 +10,8 @@
 use super::dna_utils::*;
 use super::bsc;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const MISMATCH_THRESHOLD: usize = 8;
 
@@ -54,7 +55,7 @@ fn auto_select_k(num_reads: usize, avg_read_len: usize) -> usize {
 
 struct DeBruijnGraph {
     /// Canonical k-mer hash → occurrence count
-    kmers: HashMap<u64, u16>,
+    kmers: FxHashMap<u64, u16>,
     k: usize,
 }
 
@@ -78,29 +79,42 @@ fn canonical_hash(seq: &[u8], k: usize) -> Option<u64> {
     Some(hash.min(rc))
 }
 
-/// Check if hash matches the forward orientation (hash <= rc_hash)
-fn is_forward_orientation(seq: &[u8], k: usize) -> Option<bool> {
-    let hash = kmer_to_hash(seq)?;
-    let rc = reverse_complement_hash(hash, k);
-    Some(hash <= rc)
-}
-
 impl DeBruijnGraph {
-    /// Build de Bruijn graph from sequences by counting canonical k-mers
+    /// Build de Bruijn graph from sequences by counting canonical k-mers (parallel)
     fn from_sequences(sequences: &[Vec<u8>], k: usize) -> Self {
-        let mut kmers: HashMap<u64, u16> = HashMap::new();
+        // Parallel k-mer counting: each thread builds a local map, then merge
+        let chunk_size = (sequences.len() / rayon::current_num_threads().max(1)).max(1000);
 
-        for seq in sequences {
-            if seq.len() < k { continue; }
-            for i in 0..=seq.len() - k {
-                if let Some(canon) = canonical_hash(&seq[i..i + k], k) {
-                    let count = kmers.entry(canon).or_insert(0);
-                    *count = count.saturating_add(1);
+        let local_maps: Vec<FxHashMap<u64, u16>> = sequences
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut local: FxHashMap<u64, u16> = FxHashMap::default();
+                local.reserve(chunk.len() * 128); // ~128 k-mers per 150bp read
+                for seq in chunk {
+                    if seq.len() < k { continue; }
+                    for i in 0..=seq.len() - k {
+                        if let Some(canon) = canonical_hash(&seq[i..i + k], k) {
+                            let count = local.entry(canon).or_insert(0);
+                            *count = count.saturating_add(1);
+                        }
+                    }
                 }
+                local
+            })
+            .collect();
+
+        // Merge local maps into a single global map
+        let estimated_size = local_maps.iter().map(|m| m.len()).max().unwrap_or(0);
+        let mut kmers: FxHashMap<u64, u16> = FxHashMap::default();
+        kmers.reserve(estimated_size);
+        for local in local_maps {
+            for (hash, count) in local {
+                let entry = kmers.entry(hash).or_insert(0);
+                *entry = entry.saturating_add(count);
             }
         }
 
-        println!("  De Bruijn graph: {} unique canonical {}-mers from {} reads",
+        eprintln!("  De Bruijn graph: {} unique canonical {}-mers from {} reads",
                  kmers.len(), k, sequences.len());
 
         DeBruijnGraph { kmers, k }
@@ -110,7 +124,7 @@ impl DeBruijnGraph {
     fn tip_trim(&mut self, min_count: u16) {
         let before = self.kmers.len();
         self.kmers.retain(|_, count| *count > min_count);
-        println!("  Tip trimming (count <= {}): {} → {} k-mers",
+        eprintln!("  Tip trimming (count <= {}): {} → {} k-mers",
                  min_count, before, self.kmers.len());
     }
 
@@ -171,7 +185,8 @@ impl DeBruijnGraph {
 /// Extract unitigs (maximal unbranched paths) from the de Bruijn graph.
 fn extract_unitigs(graph: &DeBruijnGraph) -> Vec<Unitig> {
     let k = graph.k;
-    let mut visited: HashSet<u64> = HashSet::new();
+    let mut visited: FxHashSet<u64> = FxHashSet::default();
+    visited.reserve(graph.kmers.len());
     let mut unitigs: Vec<Unitig> = Vec::new();
 
     // Collect all canonical hashes for iteration
@@ -254,7 +269,7 @@ fn extract_unitigs(graph: &DeBruijnGraph) -> Vec<Unitig> {
 
     let total_bases: usize = unitigs.iter().map(|u| u.sequence.len()).sum();
     let max_len = unitigs.first().map(|u| u.sequence.len()).unwrap_or(0);
-    println!("  Extracted {} unitigs ({} total bases, longest={})",
+    eprintln!("  Extracted {} unitigs ({} total bases, longest={})",
              unitigs.len(), total_bases, max_len);
 
     unitigs
@@ -269,13 +284,20 @@ struct UnitigKmerHit {
     is_forward: bool,    // true if the k-mer is in forward orientation at this position
 }
 
-/// Build an index of all k-mers in all unitigs for fast read mapping
-fn build_unitig_index(unitigs: &[Unitig], k: usize) -> HashMap<u64, Vec<UnitigKmerHit>> {
-    let mut index: HashMap<u64, Vec<UnitigKmerHit>> = HashMap::new();
+/// Build an index of all k-mers in all unitigs for fast read mapping.
+/// Samples every `step` positions to reduce index size for large datasets.
+fn build_unitig_index(unitigs: &[Unitig], k: usize) -> FxHashMap<u64, Vec<UnitigKmerHit>> {
+    let total_unitig_bases: usize = unitigs.iter().map(|u| u.sequence.len()).sum();
+    // Sample every `step` positions to keep index manageable
+    let step = if total_unitig_bases > 100_000_000 { 4 } else { 1 };
+
+    let mut index: FxHashMap<u64, Vec<UnitigKmerHit>> = FxHashMap::default();
+    index.reserve(total_unitig_bases / step.max(1));
 
     for (uid, unitig) in unitigs.iter().enumerate() {
         if unitig.sequence.len() < k { continue; }
-        for pos in 0..=unitig.sequence.len() - k {
+        let mut pos = 0;
+        while pos + k <= unitig.sequence.len() {
             let kmer = &unitig.sequence[pos..pos + k];
             if let Some(fwd_hash) = kmer_to_hash(kmer) {
                 let rc_hash = reverse_complement_hash(fwd_hash, k);
@@ -288,119 +310,108 @@ fn build_unitig_index(unitigs: &[Unitig], k: usize) -> HashMap<u64, Vec<UnitigKm
                     is_forward,
                 });
             }
+            pos += step;
         }
     }
 
     index
 }
 
-/// Map reads to unitigs using the k-mer index
+/// Map reads to unitigs using the k-mer index (parallel)
 fn map_reads_to_unitigs(
     sequences: &[Vec<u8>],
     unitigs: &[Unitig],
-    index: &HashMap<u64, Vec<UnitigKmerHit>>,
+    index: &FxHashMap<u64, Vec<UnitigKmerHit>>,
     k: usize,
 ) -> Vec<Option<ReadMapping>> {
-    let mut mappings: Vec<Option<ReadMapping>> = vec![None; sequences.len()];
+    let mappings: Vec<Option<ReadMapping>> = sequences
+        .par_iter()
+        .map(|read| {
+            if read.len() < k { return None; }
 
-    for (read_idx, read) in sequences.iter().enumerate() {
-        if read.len() < k { continue; }
+            let anchor_positions = [
+                0,
+                read.len() / 3,
+                2 * read.len() / 3,
+                read.len().saturating_sub(k),
+            ];
 
-        // Try anchor k-mers at multiple positions in the read
-        let anchor_positions = [
-            0,                              // start
-            read.len() / 3,                 // one-third
-            2 * read.len() / 3,             // two-thirds
-            read.len().saturating_sub(k),   // end
-        ];
+            let mut best_mapping: Option<ReadMapping> = None;
+            let mut best_mismatches = usize::MAX;
 
-        let mut best_mapping: Option<ReadMapping> = None;
-        let mut best_mismatches = usize::MAX;
+            for &anchor_pos in &anchor_positions {
+                if anchor_pos + k > read.len() { continue; }
+                let anchor_kmer = &read[anchor_pos..anchor_pos + k];
 
-        for &anchor_pos in &anchor_positions {
-            if anchor_pos + k > read.len() { continue; }
-            let anchor_kmer = &read[anchor_pos..anchor_pos + k];
+                let fwd_hash = match kmer_to_hash(anchor_kmer) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let rc_hash = reverse_complement_hash(fwd_hash, k);
+                let canon = fwd_hash.min(rc_hash);
+                let read_is_forward = fwd_hash <= rc_hash;
 
-            let fwd_hash = match kmer_to_hash(anchor_kmer) {
-                Some(h) => h,
-                None => continue, // has N
-            };
-            let rc_hash = reverse_complement_hash(fwd_hash, k);
-            let canon = fwd_hash.min(rc_hash);
-            let read_is_forward = fwd_hash <= rc_hash;
-
-            let hits = match index.get(&canon) {
-                Some(h) => h,
-                None => continue,
-            };
-
-            for hit in hits {
-                let unitig = &unitigs[hit.unitig_id];
-
-                // Determine if read maps in forward or RC orientation
-                // If read's k-mer orientation matches unitig's k-mer orientation → forward
-                let read_maps_forward = read_is_forward == hit.is_forward;
-
-                // Compute the read's start position in the unitig
-                let read_start: i64 = if read_maps_forward {
-                    hit.position as i64 - anchor_pos as i64
-                } else {
-                    hit.position as i64 - (read.len() as i64 - anchor_pos as i64 - k as i64)
+                let hits = match index.get(&canon) {
+                    Some(h) => h,
+                    None => continue,
                 };
 
-                if read_start < 0 { continue; }
-                let read_start = read_start as usize;
-                if read_start + read.len() > unitig.sequence.len() { continue; }
+                for hit in hits {
+                    let unitig = &unitigs[hit.unitig_id];
+                    let read_maps_forward = read_is_forward == hit.is_forward;
 
-                // Extract the unitig region and compare
-                let unitig_region = &unitig.sequence[read_start..read_start + read.len()];
+                    let read_start: i64 = if read_maps_forward {
+                        hit.position as i64 - anchor_pos as i64
+                    } else {
+                        hit.position as i64 - (read.len() as i64 - anchor_pos as i64 - k as i64)
+                    };
 
-                let (compare_seq, is_rc) = if read_maps_forward {
-                    (read.as_slice(), false)
-                } else {
-                    // Read maps in RC orientation
-                    // We need to compare RC(read) against the unitig region
-                    // Use the read directly and RC the unitig region for comparison
-                    // Actually: if read is RC, then RC(read) matches unitig_region
-                    // So compare reverse_complement(read) against unitig_region
-                    // But that's expensive. Instead: compare read against RC(unitig_region)
-                    // These are equivalent.
-                    (read.as_slice(), true)
-                };
+                    if read_start < 0 { continue; }
+                    let read_start = read_start as usize;
+                    if read_start + read.len() > unitig.sequence.len() { continue; }
 
-                let dist = if is_rc {
-                    let rc_region = reverse_complement(unitig_region);
-                    match hamming_distance_within(&rc_region, compare_seq, MISMATCH_THRESHOLD) {
-                        Some(d) => d,
-                        None => continue,
+                    let unitig_region = &unitig.sequence[read_start..read_start + read.len()];
+
+                    let (compare_seq, is_rc) = if read_maps_forward {
+                        (read.as_slice(), false)
+                    } else {
+                        (read.as_slice(), true)
+                    };
+
+                    let dist = if is_rc {
+                        let rc_region = reverse_complement(unitig_region);
+                        match hamming_distance_within(&rc_region, compare_seq, MISMATCH_THRESHOLD) {
+                            Some(d) => d,
+                            None => continue,
+                        }
+                    } else {
+                        match hamming_distance_within(unitig_region, compare_seq, MISMATCH_THRESHOLD) {
+                            Some(d) => d,
+                            None => continue,
+                        }
+                    };
+
+                    if dist < best_mismatches {
+                        best_mismatches = dist;
+                        best_mapping = Some(ReadMapping {
+                            unitig_id: hit.unitig_id,
+                            position: read_start as u32,
+                            is_rc,
+                        });
+                        if dist == 0 { break; }
                     }
-                } else {
-                    match hamming_distance_within(unitig_region, compare_seq, MISMATCH_THRESHOLD) {
-                        Some(d) => d,
-                        None => continue,
-                    }
-                };
-
-                if dist < best_mismatches {
-                    best_mismatches = dist;
-                    best_mapping = Some(ReadMapping {
-                        unitig_id: hit.unitig_id,
-                        position: read_start as u32,
-                        is_rc,
-                    });
-                    if dist == 0 { break; } // perfect match
                 }
+
+                if best_mismatches == 0 { break; }
             }
 
-            if best_mismatches == 0 { break; }
-        }
-
-        mappings[read_idx] = best_mapping;
-    }
+            best_mapping
+        })
+        .collect();
 
     let mapped = mappings.iter().filter(|m| m.is_some()).count();
     let singleton = mappings.len() - mapped;
-    println!("  Read mapping: {} / {} mapped ({:.1}%), {} singletons",
+    eprintln!("  Read mapping: {} / {} mapped ({:.1}%), {} singletons",
              mapped, sequences.len(),
              mapped as f64 / sequences.len() as f64 * 100.0,
              singleton);
@@ -418,13 +429,13 @@ fn encode_reads(
     mappings: &[Option<ReadMapping>],
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     // Determine which unitigs are actually used
-    let mut used_unitig_ids: HashSet<usize> = HashSet::new();
+    let mut used_unitig_ids: FxHashSet<usize> = FxHashSet::default();
     for m in mappings.iter().flatten() {
         used_unitig_ids.insert(m.unitig_id);
     }
 
     // Remap unitig IDs to compact range
-    let mut unitig_id_map: HashMap<usize, usize> = HashMap::new();
+    let mut unitig_id_map: FxHashMap<usize, usize> = FxHashMap::default();
     let mut used_unitigs: Vec<&Unitig> = Vec::new();
     for &uid in &used_unitig_ids {
         unitig_id_map.insert(uid, used_unitigs.len());
@@ -489,8 +500,7 @@ fn encode_reads(
 
     let singleton_bytes = pack_dna_2bit(&singleton_seqs);
 
-    let mismatch_count: usize = mappings.iter().flatten().count();
-    println!("  Encoding: {} unitigs used, {} singletons packed",
+    eprintln!("  Encoding: {} unitigs used, {} singletons packed",
              used_unitigs.len(), singleton_seqs.len());
 
     (consensus_bytes, meta_bytes, mismatch_bytes, singleton_bytes)
@@ -519,13 +529,13 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
         auto_select_k(seqs.len(), avg_readlen)
     };
 
-    println!("De Bruijn compression: {} reads, max_readlen={}, k={} ({})",
+    eprintln!("De Bruijn compression: {} reads, max_readlen={}, k={} ({})",
              seqs.len(), max_readlen, k,
              if k_override > 0 { "user-specified" } else { "auto-selected" });
 
     // If reads are shorter than k, fall back to packing them all as singletons
     if max_readlen < k {
-        println!("  Reads shorter than k={}, encoding all as singletons", k);
+        eprintln!("  Reads shorter than k={}, encoding all as singletons", k);
         let packed = pack_dna_2bit(&seqs);
         let compressed = bsc::compress_parallel(&packed)?;
         let mut output = Vec::new();
@@ -540,7 +550,7 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
     }
 
     // Pass 1: Build graph + extract unitigs
-    println!("  Pass 1: Building de Bruijn graph...");
+    eprintln!("  Pass 1: Building de Bruijn graph...");
     let mut graph = DeBruijnGraph::from_sequences(&seqs, k);
 
     // Adaptive tip trimming: if most k-mers are singletons, trimming kills
@@ -551,17 +561,17 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
 
     let trim_threshold = if singleton_frac > 0.90 {
         // >90% singletons: skip trimming entirely (shallow data, most k-mers are real)
-        println!("  Singleton fraction: {:.1}% — skipping tip trimming (shallow coverage)",
+        eprintln!("  Singleton fraction: {:.1}% — skipping tip trimming (shallow coverage)",
                  singleton_frac * 100.0);
         0
     } else if singleton_frac > 0.70 {
         // 70-90%: gentle trim
-        println!("  Singleton fraction: {:.1}% — gentle tip trimming (threshold=1)",
+        eprintln!("  Singleton fraction: {:.1}% — gentle tip trimming (threshold=1)",
                  singleton_frac * 100.0);
         1
     } else {
         // <70%: deep coverage, aggressive trim removes errors effectively
-        println!("  Singleton fraction: {:.1}% — standard tip trimming (threshold=1)",
+        eprintln!("  Singleton fraction: {:.1}% — standard tip trimming (threshold=1)",
                  singleton_frac * 100.0);
         1
     };
@@ -573,25 +583,25 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
     let unitigs = extract_unitigs(&graph);
 
     // Pass 2: Map reads to unitigs
-    println!("  Pass 2: Mapping reads to unitigs...");
+    eprintln!("  Pass 2: Mapping reads to unitigs...");
     let index = build_unitig_index(&unitigs, k);
     let mappings = map_reads_to_unitigs(&seqs, &unitigs, &index, k);
 
     // Encode into 4 streams
-    println!("  Encoding streams...");
+    eprintln!("  Encoding streams...");
     let (consensus_raw, meta_raw, mismatch_raw, singleton_raw) =
         encode_reads(&seqs, &unitigs, &mappings);
 
     // BSC-compress each stream
-    println!("  BSC-compressing 4 streams...");
+    eprintln!("  BSC-compressing 4 streams...");
     let bsc_consensus = bsc::compress_parallel(&consensus_raw)?;
     let bsc_meta = bsc::compress_parallel(&meta_raw)?;
     let bsc_mismatches = bsc::compress_parallel(&mismatch_raw)?;
     let bsc_singletons = bsc::compress_parallel(&singleton_raw)?;
 
-    println!("  Raw: consensus={}, meta={}, mismatches={}, singletons={}",
+    eprintln!("  Raw: consensus={}, meta={}, mismatches={}, singletons={}",
              consensus_raw.len(), meta_raw.len(), mismatch_raw.len(), singleton_raw.len());
-    println!("  BSC: consensus={}, meta={}, mismatches={}, singletons={}",
+    eprintln!("  BSC: consensus={}, meta={}, mismatches={}, singletons={}",
              bsc_consensus.len(), bsc_meta.len(), bsc_mismatches.len(), bsc_singletons.len());
 
     // Serialize: magic + num_reads + 4 stream lengths + 4 streams
@@ -609,7 +619,7 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
 
     let total = output.len();
     let original = sequences.iter().map(|s| s.len()).sum::<usize>();
-    println!("  De Bruijn sequence compression: {} → {} bytes ({:.2}x)",
+    eprintln!("  De Bruijn sequence compression: {} → {} bytes ({:.2}x)",
              original, total, original as f64 / total as f64);
 
     Ok(output)
@@ -619,13 +629,11 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
 
 /// Decompress de Bruijn-encoded sequences
 pub fn decompress_sequences_debruijn(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
-    let mut offset = 0;
-
     // Read and verify magic
     if data.len() < 4 || &data[0..4] != b"DBG1" {
         anyhow::bail!("Invalid de Bruijn magic bytes");
     }
-    offset = 4;
+    let mut offset = 4;
 
     let stored_num_reads = read_u64(data, &mut offset)
         .ok_or_else(|| anyhow::anyhow!("Failed to read num_reads"))? as usize;

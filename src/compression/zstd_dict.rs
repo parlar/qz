@@ -141,26 +141,6 @@ pub fn decompress_with_dict(compressed: &[u8], dictionary: &[u8]) -> Result<Vec<
     Ok(decompressed)
 }
 
-/// Collect samples for dictionary training
-/// Takes a subset of quality strings to avoid using too much memory
-pub fn collect_training_samples<'a>(
-    quality_strings: &'a [String],
-    max_samples: usize,
-) -> Vec<&'a [u8]> {
-    let sample_interval = if quality_strings.len() > max_samples {
-        quality_strings.len() / max_samples
-    } else {
-        1
-    };
-
-    quality_strings
-        .iter()
-        .step_by(sample_interval)
-        .take(max_samples)
-        .map(|s| s.as_bytes())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,16 +160,6 @@ mod tests {
         let dict = train_dictionary(&samples, 256).unwrap();
         assert!(!dict.is_empty());
         assert!(dict.len() <= 256);
-    }
-
-    #[test]
-    fn test_collect_samples() {
-        let qualities: Vec<String> = (0..1000)
-            .map(|i| format!("QUALITY_{}", i))
-            .collect();
-
-        let samples = collect_training_samples(&qualities, 100);
-        assert_eq!(samples.len(), 100);
     }
 
     #[test]

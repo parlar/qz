@@ -21,7 +21,7 @@ const MAX_QUALITY_CONTEXT: u8 = 40; // Bin high qualities together
 
 /// Context for quality score prediction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct QualityContext {
+pub(crate) struct QualityContext {
     position_bin: u8,    // 0-19 (position in read divided into bins)
     prev_quality: u8,    // Previous quality (binned to 0-40)
     base: u8,            // Base call (0=A, 1=C, 2=G, 3=T, 4=N)
@@ -60,7 +60,7 @@ impl AdaptiveQualityModel {
     }
 
     /// Get probability distribution for a context
-    pub fn get_probabilities(&mut self, context: &QualityContext) -> Vec<f64> {
+    pub(crate) fn get_probabilities(&mut self, context: &QualityContext) -> Vec<f64> {
         let ctx_hash = context.hash();
         let counts = self
             .contexts
@@ -72,11 +72,14 @@ impl AdaptiveQualityModel {
     }
 
     /// Update model after observing a symbol
-    pub fn update(&mut self, context: &QualityContext, symbol: u8) {
+    pub(crate) fn update(&mut self, context: &QualityContext, symbol: u8) {
         let ctx_hash = context.hash();
-        let counts = self.contexts.get_mut(&ctx_hash).unwrap();
+        let counts = self
+            .contexts
+            .entry(ctx_hash)
+            .or_insert_with(|| vec![1u32; NUM_QUALITY_VALUES]);
 
-        counts[symbol as usize] += 1;
+        counts[(symbol as usize).min(NUM_QUALITY_VALUES - 1)] += 1;
 
         // Rescale if needed to prevent overflow
         let total: u32 = counts.iter().sum();
@@ -190,7 +193,7 @@ pub fn decode_qualities_arithmetic(
     let mut model = AdaptiveQualityModel::new();
     let mut qualities = Vec::with_capacity(num_reads);
 
-    for (read_idx, seq_str) in sequences.iter().enumerate().take(num_reads) {
+    for seq_str in sequences.iter().take(num_reads) {
         let seq_bytes = seq_str.as_bytes();
         let mut qual_bytes = Vec::with_capacity(read_length);
         let mut prev_quality = 0u8;
