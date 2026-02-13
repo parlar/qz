@@ -1,0 +1,31 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE / build
+.vscode/
+.idea/
+cmake-build-*/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test data and outputs
+test_data/
+*.fqz
+decompressed*.fastq
+test_*_decompressed.fastq
+
+# Benchmark results
+benchmark_results/
+*.benchmark
+
+# Real data
+real_data/
+
+# Third-party tools
+third_party/
+ideas/
