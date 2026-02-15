@@ -21,6 +21,7 @@ test_*_decompressed.fastq
 
 # Benchmark results
 benchmark_results/
+benchmarks
 *.benchmark
 
 # Real data

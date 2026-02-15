@@ -270,7 +270,10 @@ pub fn compress_qualities_ctx(qualities: &[&str], sequences: &[&str]) -> Result<
         sym_map[s as usize] = i as u8;
     }
 
-    let read_len = qualities[0].len();
+    // Detect variable-length reads; store read_len=0 as sentinel
+    let first_len = qualities[0].len();
+    let variable = qualities.iter().any(|q| q.len() != first_len);
+    let read_len: u16 = if variable { 0 } else { first_len as u16 };
     let num_reads = qualities.len();
 
     // Context model lookup: flat Vec, u32::MAX = uninitialized
@@ -315,8 +318,7 @@ pub fn compress_qualities_ctx(qualities: &[&str], sequences: &[&str]) -> Result<
     let mut result = Vec::new();
     result.push(n_symbols as u8);
     result.extend_from_slice(&symbols);
-    result.push((read_len & 0xFF) as u8);
-    result.push(((read_len >> 8) & 0xFF) as u8);
+    result.extend_from_slice(&read_len.to_le_bytes());
     result.extend_from_slice(&(num_reads as u32).to_le_bytes());
     result.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
     result.extend_from_slice(&compressed);
@@ -361,11 +363,12 @@ pub fn decompress_qualities_ctx(
 
     for i in 0..num_reads {
         let sb = sequences[i].as_bytes();
-        let mut qual_bytes = Vec::with_capacity(read_len);
+        let this_len = if read_len > 0 { read_len } else { sb.len() };
+        let mut qual_bytes = Vec::with_capacity(this_len);
         let mut prev_q: u8 = 0;
         let mut prev_q2: u8 = 0;
 
-        for j in 0..read_len {
+        for j in 0..this_len {
             let cur_base = base_to_idx(sb[j]);
             let prev_base = if j > 0 { base_to_idx(sb[j - 1]) } else { 4 };
             let ctx = context_id(j, prev_q, prev_q2, prev_base, cur_base);
@@ -409,7 +412,9 @@ pub fn decompress_quality_ctx_multiblock(
 
     let num_blocks = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let mut offset = 4;
-    let mut all_qualities = Vec::with_capacity(sequences.len());
+
+    // Phase 1: parse block boundaries and compute sequence ranges (fast, sequential)
+    let mut block_info: Vec<(&[u8], usize, usize)> = Vec::with_capacity(num_blocks); // (blob, seq_start, num_reads)
     let mut seq_cursor = 0;
 
     for _ in 0..num_blocks {
@@ -427,19 +432,32 @@ pub fn decompress_quality_ctx_multiblock(
 
         // Extract num_reads from blob header: [n_symbols:1B][symbols:nB][read_len:2B][num_reads:4B]
         let n_symbols = blob[0] as usize;
-        let nr_offset = 1 + n_symbols + 2; // skip n_symbols + symbols + read_len
+        let nr_offset = 1 + n_symbols + 2;
         let chunk_reads = u32::from_le_bytes(
             blob[nr_offset..nr_offset + 4].try_into().unwrap()
         ) as usize;
 
-        let seq_refs: Vec<&str> = sequences[seq_cursor..seq_cursor + chunk_reads]
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-
-        let chunk_qualities = decompress_qualities_ctx(blob, &seq_refs, chunk_reads)?;
-        all_qualities.extend(chunk_qualities);
+        block_info.push((blob, seq_cursor, chunk_reads));
         seq_cursor += chunk_reads;
+    }
+
+    // Phase 2: decode all blocks in parallel (each block is independent)
+    use rayon::prelude::*;
+    let decoded_blocks: Vec<Result<Vec<String>>> = block_info
+        .into_par_iter()
+        .map(|(blob, seq_start, chunk_reads)| {
+            let seq_refs: Vec<&str> = sequences[seq_start..seq_start + chunk_reads]
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            decompress_qualities_ctx(blob, &seq_refs, chunk_reads)
+        })
+        .collect();
+
+    // Phase 3: concatenate in order
+    let mut all_qualities = Vec::with_capacity(sequences.len());
+    for result in decoded_blocks {
+        all_qualities.extend(result?);
     }
 
     Ok(all_qualities)
@@ -584,6 +602,36 @@ mod tests {
         let decompressed = decompress_qualities_ctx(&compressed, &sequences, n).unwrap();
 
         for i in 0..n {
+            assert_eq!(decompressed[i], qualities[i], "read {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_variable_length() {
+        let sequences = vec![
+            "ACGTACGTAC",       // 10bp
+            "TTTGGGCCCAAACCC",  // 15bp
+            "ACGTAC",           // 6bp
+            "NNNNACGTNNNNACGT", // 16bp
+        ];
+        let qualities = vec![
+            "IIIIII5555",       // 10
+            "555555IIIIIIIII",  // 15
+            "I5I5I5",           // 6
+            "!!!!IIII!!!!IIII", // 16
+        ];
+
+        let compressed = compress_qualities_ctx(&qualities, &sequences).unwrap();
+
+        // Verify read_len == 0 sentinel in header
+        let n_sym = compressed[0] as usize;
+        let stored_read_len =
+            compressed[1 + n_sym] as u16 | ((compressed[1 + n_sym + 1] as u16) << 8);
+        assert_eq!(stored_read_len, 0, "variable-length sentinel should be 0");
+
+        let decompressed = decompress_qualities_ctx(&compressed, &sequences, 4).unwrap();
+
+        for i in 0..4 {
             assert_eq!(decompressed[i], qualities[i], "read {i} mismatch");
         }
     }

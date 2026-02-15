@@ -134,8 +134,21 @@ pub fn compress_adaptive(data: &[u8]) -> Result<Vec<u8>> {
     compress_with_params(data, 16, 128, LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE)
 }
 
+/// Compress using adaptive coder without LZP preprocessing.
+/// Faster than full adaptive (skips LZP hash table), same QLFC quality.
+/// Best for DNA/quality data where LZP doesn't help much (BWT captures patterns).
+pub fn compress_adaptive_no_lzp(data: &[u8]) -> Result<Vec<u8>> {
+    compress_with_params(data, 0, 0, LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE)
+}
+
+/// Block-parallel adaptive compression without LZP.
+pub fn compress_parallel_adaptive_no_lzp(data: &[u8]) -> Result<Vec<u8>> {
+    compress_parallel_with(data, compress_adaptive_no_lzp)
+}
+
 /// Compress using adaptive coder with BSC-internal multithreading (OpenMP).
 /// Use this for single large blocks where rayon can't parallelize across blocks.
+/// No LZP — DNA data doesn't benefit from it (BWT captures patterns).
 pub fn compress_adaptive_mt(data: &[u8]) -> Result<Vec<u8>> {
     ensure_initialized();
 
@@ -150,8 +163,8 @@ pub fn compress_adaptive_mt(data: &[u8]) -> Result<Vec<u8>> {
             data.as_ptr(),
             output.as_mut_ptr(),
             data.len() as c_int,
-            16,  // lzp_hash_size
-            128, // lzp_min_len
+            0,   // lzp_hash_size (disabled)
+            0,   // lzp_min_len (disabled)
             LIBBSC_BLOCKSORTER_BWT,
             LIBBSC_CODER_QLFC_ADAPTIVE,
             LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING,

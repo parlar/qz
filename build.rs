@@ -20,6 +20,7 @@ fn main() {
             "third_party/libbsc/libbsc/st/st.cpp",
         ])
         .flag_if_supported("-O3")
+        .flag_if_supported("-march=native")     // Use AVX2/SSE for faster BWT
         .flag_if_supported("-std=c++11")
         .flag_if_supported("-fopenmp") // For multithreading support
         .define("LIBBSC_OPENMP_SUPPORT", None) // Enable BSC's OpenMP code paths

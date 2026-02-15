@@ -29,6 +29,89 @@ const CHUNK_SIZE: usize = 5_000_000;
 /// Dictionary window size for center hash (HARC/SPRING style).
 const DICT_WINDOW: usize = 32;
 
+// ── Ultra compression levels ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct UltraLevel {
+    pub level: u8,
+    pub chunk_size: usize,
+    pub max_parallel_chunks: usize,
+    pub quality_sub_block: usize,
+}
+
+const ULTRA_LEVELS: [UltraLevel; 5] = [
+    UltraLevel { level: 1, chunk_size: 1_000_000, max_parallel_chunks: 4, quality_sub_block: 250_000 },
+    UltraLevel { level: 2, chunk_size: 2_000_000, max_parallel_chunks: 3, quality_sub_block: 500_000 },
+    UltraLevel { level: 3, chunk_size: 5_000_000, max_parallel_chunks: 2, quality_sub_block: 500_000 },
+    UltraLevel { level: 4, chunk_size: 8_000_000, max_parallel_chunks: 2, quality_sub_block: 1_000_000 },
+    UltraLevel { level: 5, chunk_size: 10_000_000, max_parallel_chunks: 1, quality_sub_block: 1_000_000 },
+];
+
+fn available_memory_bytes() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if line.starts_with("MemAvailable:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1].parse::<u64>().ok().map(|kb| kb * 1024);
+            }
+        }
+    }
+    None
+}
+
+fn estimate_peak_memory(level: &UltraLevel) -> u64 {
+    let per_read_bytes: u64 = 1500;
+    let io_overhead: u64 = 2 * 1024 * 1024 * 1024;
+    level.chunk_size as u64 * per_read_bytes * level.max_parallel_chunks as u64 + io_overhead
+}
+
+fn auto_select_level() -> u8 {
+    let available = match available_memory_bytes() {
+        Some(bytes) => bytes,
+        None => {
+            info!("Could not detect available memory, defaulting to ultra level 2");
+            return 2;
+        }
+    };
+
+    let budget = available * 80 / 100;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+
+    let max_level_for_cores: u8 = if cores < 4 { 1 }
+        else if cores < 8 { 2 }
+        else if cores < 16 { 3 }
+        else { 5 };
+
+    let mut selected = 1u8;
+    for level in &ULTRA_LEVELS {
+        if estimate_peak_memory(level) <= budget && level.level <= max_level_for_cores {
+            selected = level.level;
+        }
+    }
+
+    info!(
+        "Auto-selected ultra level {} (available: {:.1} GB, budget: {:.1} GB, cores: {})",
+        selected,
+        available as f64 / 1e9,
+        budget as f64 / 1e9,
+        cores,
+    );
+
+    selected
+}
+
+pub(super) fn resolve_ultra_level(requested: u8) -> UltraLevel {
+    let level = if requested == 0 {
+        auto_select_level()
+    } else {
+        requested.clamp(1, 5)
+    };
+    ULTRA_LEVELS[(level - 1) as usize]
+}
+
 // ── Center hash ─────────────────────────────────────────────────────────
 
 /// Compute a 2-bit hash of a k-mer at a fixed position in the sequence.
@@ -748,14 +831,35 @@ enum QualInput {
 }
 
 /// Compress quality input into blocks (runs on its own rayon task).
-fn compress_qual_input(input: QualInput, bsc_static: bool) -> Result<Vec<Vec<u8>>> {
+fn compress_qual_input(input: QualInput, bsc_static: bool, sub_block_reads: usize) -> Result<Vec<Vec<u8>>> {
     match input {
         QualInput::None => Ok(Vec::new()),
         QualInput::Ctx { qual_strs, seq_strs } => {
-            let qual_refs: Vec<&str> = qual_strs.iter().map(|s| s.as_str()).collect();
-            let seq_refs: Vec<&str> = seq_strs.iter().map(|s| s.as_str()).collect();
-            let ctx_blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
-            Ok(vec![ctx_blob])
+            use rayon::prelude::*;
+
+            let n = qual_strs.len();
+
+            if n <= sub_block_reads {
+                let qual_refs: Vec<&str> = qual_strs.iter().map(|s| s.as_str()).collect();
+                let seq_refs: Vec<&str> = seq_strs.iter().map(|s| s.as_str()).collect();
+                let ctx_blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
+                return Ok(vec![ctx_blob]);
+            }
+
+            // Split into sub-blocks and compress each in parallel
+            let num_blocks = (n + sub_block_reads - 1) / sub_block_reads;
+            let blobs: Vec<Result<Vec<u8>>> = (0..num_blocks)
+                .into_par_iter()
+                .map(|i| {
+                    let start = i * sub_block_reads;
+                    let end = (start + sub_block_reads).min(n);
+                    let qual_refs: Vec<&str> = qual_strs[start..end].iter().map(|s| s.as_str()).collect();
+                    let seq_refs: Vec<&str> = seq_strs[start..end].iter().map(|s| s.as_str()).collect();
+                    quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)
+                })
+                .collect();
+
+            blobs.into_iter().collect()
         }
         QualInput::Bsc(qual_stream) => {
             compress_stream_to_bsc_blocks(&qual_stream, bsc_static)
@@ -771,12 +875,13 @@ fn compress_chunk(
     no_quality: bool,
     bsc_static: bool,
     use_quality_ctx: bool,
+    quality_sub_block: usize,
 ) -> Result<ChunkResult> {
     let n = records.len();
     let compress_fn: fn(&[u8]) -> Result<Vec<u8>> = if bsc_static {
         bsc::compress
     } else {
-        bsc::compress_adaptive
+        bsc::compress_adaptive_no_lzp
     };
 
     // Reorder strategy: identity (no reorder) is best — natural input order
@@ -851,19 +956,28 @@ fn compress_chunk(
 
             // Parallel: quality compression || (BSC headers + BSC sequences)
             let (q_result, hs_result) = rayon::join(
-                || compress_qual_input(qual_input, bsc_static),
+                || compress_qual_input(qual_input, bsc_static, quality_sub_block),
                 || -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
                     let h_blocks = compress_stream_to_bsc_blocks(&header_stream, bsc_static)?;
                     let seq_streams = vec![order_stream, seq_stream, rl_stream];
                     let num_seq_streams = seq_streams.len() as u8;
 
-                    // Single large block with BSC multithreading (OpenMP parallel BWT).
-                    let compressed_blocks: Vec<Vec<Vec<u8>>> = seq_streams.into_iter().map(|data| {
+                    // BSC compress each seq stream. Split large streams into
+                    // <=750MB blocks to stay within libsais's working limits.
+                    const MAX_BSC_BLOCK: usize = 750 * 1024 * 1024;
+                    use rayon::prelude::*;
+                    let compressed_blocks: Vec<Vec<Vec<u8>>> = seq_streams.into_par_iter().map(|data| {
                         if data.is_empty() {
                             Ok(Vec::new())
-                        } else {
+                        } else if data.len() <= MAX_BSC_BLOCK {
                             let compressed = bsc::compress_adaptive_mt(&data)?;
                             Ok(vec![compressed])
+                        } else {
+                            let chunks: Vec<&[u8]> = data.chunks(MAX_BSC_BLOCK).collect();
+                            let blocks: Vec<Vec<u8>> = chunks.par_iter()
+                                .map(|chunk| bsc::compress_adaptive_mt(chunk))
+                                .collect::<Result<Vec<_>>>()?;
+                            Ok(blocks)
                         }
                     }).collect::<Result<Vec<_>>>()?;
 
@@ -925,7 +1039,7 @@ fn compress_chunk(
 
             // Parallel: quality compression || (BSC headers + BSC sequences)
             let (q_result, hs_result) = rayon::join(
-                || compress_qual_input(qual_input, bsc_static),
+                || compress_qual_input(qual_input, bsc_static, quality_sub_block),
                 || -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
                     let h_blocks = compress_stream_to_bsc_blocks(&header_stream, bsc_static)?;
                     let compressed_blocks: Vec<Vec<Vec<u8>>> = {
@@ -976,6 +1090,10 @@ fn compress_chunk(
 // ── Public API: compress ─────────────────────────────────────────────────
 
 fn compress_inner(args: &CompressArgs, mode: HarcMode) -> Result<()> {
+    compress_inner_with(args, mode, CHUNK_SIZE, 2, 500_000)
+}
+
+fn compress_inner_with(args: &CompressArgs, mode: HarcMode, chunk_size: usize, max_parallel_chunks: usize, quality_sub_block: usize) -> Result<()> {
     use std::io::{Write, BufWriter};
     use crate::cli::QualityCompressor;
 
@@ -1037,71 +1155,105 @@ fn compress_inner(args: &CompressArgs, mode: HarcMode) -> Result<()> {
     let mut original_size: usize = 0;
 
     let mut reader = crate::io::FastqReader::from_path(&args.input[0], args.fasta)?;
-    let (mut cur_records, _, mut cur_orig) = read_chunk_records(&mut reader, CHUNK_SIZE)?;
 
-    // Check if first chunk has variable-length reads (quality_ctx needs fixed-length)
-    let variable_lengths = if use_quality_ctx && !cur_records.is_empty() {
-        let first_len = cur_records[0].sequence.len();
-        cur_records.iter().any(|r| r.sequence.len() != first_len)
-    } else {
-        false
-    };
-    let use_quality_ctx = use_quality_ctx && !variable_lengths;
+    // Read first chunk to check variable-length reads
+    let (first_records, _, first_orig) = read_chunk_records(&mut reader, chunk_size)?;
+    if first_records.is_empty() {
+        // Empty file — write minimal archive and return
+        h_tmp.flush()?; s_tmp.flush()?; q_tmp.flush()?;
+        drop(h_tmp); drop(s_tmp); drop(q_tmp);
+        let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
+        use std::io::Write as _;
+        out.write_all(&[mode.encoding_type()])?;
+        out.write_all(&[0u8; 51])?;
+        out.flush()?;
+        return Ok(());
+    }
+
     let quality_compressor_used = if use_quality_ctx {
         QualityCompressor::QualityCtx
     } else {
         QualityCompressor::Bsc
     };
-    if variable_lengths && args.quality_compressor == QualityCompressor::QualityCtx {
-        info!("Warning: quality-ctx requires fixed-length reads, falling back to BSC");
-    }
+
+    // Process up to max_parallel_chunks simultaneously to overlap BWT work across chunks,
+    // while keeping memory bounded.
 
     let mut chunk_idx = 0usize;
+    let mut pending: Vec<(Vec<crate::io::FastqRecord>, usize)> = vec![(first_records, first_orig)];
 
-    while !cur_records.is_empty() {
-        let cur_reads = cur_records.len();
-        info!("Chunk {}: {} reads", chunk_idx, cur_reads);
+    loop {
+        // Fill batch: read up to max_parallel_chunks
+        while pending.len() < max_parallel_chunks {
+            let (records, _, orig) = read_chunk_records(&mut reader, chunk_size)?;
+            if records.is_empty() { break; }
+            pending.push((records, orig));
+        }
+        if pending.is_empty() { break; }
 
-        let (next_result, compress_result) = std::thread::scope(|scope| {
-            let records = std::mem::take(&mut cur_records);
+        let batch = std::mem::take(&mut pending);
+        let batch_len = batch.len();
+        let start_idx = chunk_idx;
 
-            let compress_handle = scope.spawn(move || -> Result<ChunkResult> {
-                let t = Instant::now();
-                let result = compress_chunk(
-                    records, mode, quality_mode, quality_binning, no_quality, bsc_static,
-                    use_quality_ctx,
-                )?;
-                info!("  Chunk {}: {} reads, {:.2}s",
-                    chunk_idx, result.num_reads, t.elapsed().as_secs_f64());
-                Ok(result)
+        if batch_len > 1 {
+            info!("Compressing chunks {}..{} in parallel ({} chunks)",
+                start_idx, start_idx + batch_len - 1, batch_len);
+        } else {
+            info!("Chunk {}: {} reads", start_idx, batch[0].0.len());
+        }
+
+        // Compress batch in parallel (read next batch on main thread)
+        let (next_batch, results) = std::thread::scope(|scope| {
+            let compress_handle = scope.spawn(|| -> Vec<Result<(ChunkResult, usize)>> {
+                use rayon::prelude::*;
+                batch.into_par_iter().enumerate().map(|(i, (records, orig))| {
+                    let t = Instant::now();
+                    let n = records.len();
+                    let result = compress_chunk(
+                        records, mode, quality_mode, quality_binning, no_quality,
+                        bsc_static, use_quality_ctx, quality_sub_block,
+                    )?;
+                    info!("  Chunk {}: {} reads, {:.2}s",
+                        start_idx + i, n, t.elapsed().as_secs_f64());
+                    Ok((result, orig))
+                }).collect()
             });
 
-            let next = read_chunk_records(&mut reader, CHUNK_SIZE);
+            // Read next batch while compressing
+            let mut next = Vec::new();
+            for _ in 0..max_parallel_chunks {
+                match read_chunk_records(&mut reader, chunk_size) {
+                    Ok((records, _, orig)) => {
+                        if records.is_empty() { break; }
+                        next.push((records, orig));
+                    }
+                    Err(e) => { next.push((Vec::new(), 0)); eprintln!("Read error: {e}"); break; }
+                }
+            }
+
             let compressed = compress_handle.join().unwrap();
             (next, compressed)
         });
 
-        let chunk = compress_result?;
-
-        h_num_blocks += write_blocks_to_tmp(chunk.h_blocks, &mut h_tmp)?;
-        if !chunk.q_blocks.is_empty() {
-            q_num_blocks += write_blocks_to_tmp(chunk.q_blocks, &mut q_tmp)?;
+        // Write results in order
+        for result in results {
+            let (chunk, orig) = result?;
+            h_num_blocks += write_blocks_to_tmp(chunk.h_blocks, &mut h_tmp)?;
+            if !chunk.q_blocks.is_empty() {
+                q_num_blocks += write_blocks_to_tmp(chunk.q_blocks, &mut q_tmp)?;
+            }
+            {
+                use std::io::Write as _;
+                s_tmp.write_all(&(chunk.seq_data.len() as u32).to_le_bytes())?;
+                s_tmp.write_all(&chunk.seq_data)?;
+                s_chunks += 1;
+            }
+            num_reads += chunk.num_reads;
+            original_size += orig;
         }
 
-        {
-            use std::io::Write as _;
-            s_tmp.write_all(&(chunk.seq_data.len() as u32).to_le_bytes())?;
-            s_tmp.write_all(&chunk.seq_data)?;
-            s_chunks += 1;
-        }
-
-        num_reads += cur_reads;
-        original_size += cur_orig;
-        chunk_idx += 1;
-
-        let (nr, _, no) = next_result?;
-        cur_records = nr;
-        cur_orig = no;
+        chunk_idx += batch_len;
+        pending = next_batch;
     }
 
     h_tmp.flush()?;
@@ -1183,6 +1335,12 @@ pub(super) fn compress_reorder_local(args: &CompressArgs) -> Result<()> {
     compress_inner(args, HarcMode::ReorderLocal)
 }
 
+pub(super) fn compress_reorder_local_with_level(args: &CompressArgs, level: UltraLevel) -> Result<()> {
+    info!("Ultra level {}: chunk_size={}M, parallel_chunks={}, quality_sub_block={}K",
+        level.level, level.chunk_size / 1_000_000, level.max_parallel_chunks, level.quality_sub_block / 1000);
+    compress_inner_with(args, HarcMode::ReorderLocal, level.chunk_size, level.max_parallel_chunks, level.quality_sub_block)
+}
+
 // ── Decoding ────────────────────────────────────────────────────────────
 
 /// Decode result: sequences in reordered order + permutation for restoring original order.
@@ -1209,9 +1367,9 @@ fn decode_chunked(seq_region: &[u8], num_reads: usize, is_delta: bool) -> Result
 
     let num_chunks = u32::from_le_bytes(seq_region[..4].try_into().unwrap()) as usize;
     let mut off = 4usize;
-    let mut all_sequences = Vec::with_capacity(num_reads);
-    let mut all_order = Vec::with_capacity(num_reads);
 
+    // Phase 1: parse chunk boundaries (fast, sequential pointer math)
+    let mut chunk_slices: Vec<&[u8]> = Vec::with_capacity(num_chunks);
     for chunk_idx in 0..num_chunks {
         if off + 4 > seq_region.len() {
             anyhow::bail!("HARC: truncated chunk {} length", chunk_idx);
@@ -1221,18 +1379,34 @@ fn decode_chunked(seq_region: &[u8], num_reads: usize, is_delta: bool) -> Result
         if off + chunk_len > seq_region.len() {
             anyhow::bail!("HARC: truncated chunk {} data", chunk_idx);
         }
-        let chunk_data = &seq_region[off..off + chunk_len];
+        chunk_slices.push(&seq_region[off..off + chunk_len]);
         off += chunk_len;
+    }
 
-        let (seqs, order) = if is_delta {
-            decode_chunk_delta(chunk_data)
-                .with_context(|| format!("Failed to decode HARC delta chunk {}", chunk_idx))?
-        } else {
-            decode_chunk_reorder_local(chunk_data)
-                .with_context(|| format!("Failed to decode reorder-local chunk {}", chunk_idx))?
-        };
+    // Phase 2: decode all chunks in parallel (inverse BWT is the bottleneck)
+    use rayon::prelude::*;
+    let decoded_chunks: Vec<Result<(Vec<String>, Vec<u32>)>> = chunk_slices
+        .into_par_iter()
+        .enumerate()
+        .map(|(chunk_idx, chunk_data)| {
+            if is_delta {
+                decode_chunk_delta(chunk_data)
+                    .with_context(|| format!("Failed to decode HARC delta chunk {}", chunk_idx))
+            } else {
+                decode_chunk_reorder_local(chunk_data)
+                    .with_context(|| format!("Failed to decode reorder-local chunk {}", chunk_idx))
+            }
+        })
+        .collect();
+
+    // Phase 3: concatenate results with offset order indices
+    let mut all_sequences = Vec::with_capacity(num_reads);
+    let mut all_order = Vec::with_capacity(num_reads);
+    for result in decoded_chunks {
+        let (seqs, order) = result?;
+        let chunk_offset = all_sequences.len() as u32;
         all_sequences.extend(seqs);
-        all_order.extend(order);
+        all_order.extend(order.into_iter().map(|idx| idx + chunk_offset));
     }
 
     if all_sequences.len() != num_reads {

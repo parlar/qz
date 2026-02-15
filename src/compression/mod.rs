@@ -136,12 +136,14 @@ pub use columnar::{
 
 // Advanced and tier2 features not currently exposed in public API
 
-/// Dispatch BSC parallel compression: adaptive (default) or static (--bsc-static).
+/// Dispatch BSC parallel compression: static (--bsc-static) or adaptive-no-LZP (default).
+/// Default uses adaptive QLFC without LZP — LZP doesn't help DNA/quality data
+/// (BWT already captures patterns; SPRING also disables LZP).
 fn bsc_compress_parallel(data: &[u8], use_static: bool) -> Result<Vec<u8>> {
     if use_static {
         bsc::compress_parallel(data)
     } else {
-        bsc::compress_parallel_adaptive(data)
+        bsc::compress_parallel_adaptive_no_lzp(data)
     }
 }
 
@@ -316,17 +318,12 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
         header_stream.len(), seq_stream.len(), qual_stream.len());
 
     // Decide quality compression method
-    // Auto-select quality_ctx for large fixed-length lossless datasets,
+    // Auto-select quality_ctx for large lossless datasets,
     // or respect an explicit QualityCompressor::QualityCtx setting
     let use_quality_ctx = collect_for_ctx
-        && !variable_lengths
         && !args.no_quality
         && (args.quality_compressor == QualityCompressor::QualityCtx
             || num_reads >= MIN_READS_QUALITY_CTX);
-
-    if args.quality_compressor == QualityCompressor::QualityCtx && !use_quality_ctx && variable_lengths {
-        info!("Warning: quality-ctx requires fixed-length reads, falling back to BSC");
-    }
 
     let quality_compressor_used = if use_quality_ctx {
         QualityCompressor::QualityCtx
@@ -342,19 +339,48 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
         let qual_refs: Vec<&str> = qual_strings.iter().map(|s| s.as_str()).collect();
         let seq_refs: Vec<&str> = seq_strings.iter().map(|s| s.as_str()).collect();
 
-        // Compress headers + sequences in parallel, then quality_ctx (needs sequence context)
-        let (header_result, seq_result) = rayon::join(
+        // All three in parallel: headers || sequences || quality_ctx (sub-block parallel)
+        let (header_result, (seq_result, qual_result)) = rayon::join(
             || bsc_compress_parallel(&header_stream, bsc_static),
-            || bsc_compress_parallel(&seq_stream, bsc_static),
+            || rayon::join(
+                || bsc_compress_parallel(&seq_stream, bsc_static),
+                || -> Result<Vec<u8>> {
+                    use rayon::prelude::*;
+                    const SUB_BLOCK_READS: usize = 500_000;
+                    let n = qual_refs.len();
+
+                    if n <= SUB_BLOCK_READS {
+                        let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
+                        Ok(quality_ctx::wrap_as_multiblock(blob))
+                    } else {
+                        let num_blocks = (n + SUB_BLOCK_READS - 1) / SUB_BLOCK_READS;
+                        let blobs: Vec<Result<Vec<u8>>> = (0..num_blocks)
+                            .into_par_iter()
+                            .map(|i| {
+                                let start = i * SUB_BLOCK_READS;
+                                let end = (start + SUB_BLOCK_READS).min(n);
+                                quality_ctx::compress_qualities_ctx(&qual_refs[start..end], &seq_refs[start..end])
+                            })
+                            .collect();
+
+                        let mut result = Vec::new();
+                        result.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+                        for blob in blobs {
+                            let blob = blob?;
+                            result.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                            result.extend(blob);
+                        }
+                        Ok(result)
+                    }
+                },
+            ),
         );
         drop(header_stream);
         drop(seq_stream);
-
-        let ctx_blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
         drop(qual_strings);
         drop(seq_strings);
-        let qualities = quality_ctx::wrap_as_multiblock(ctx_blob);
 
+        let qualities = qual_result?;
         info!("Quality ctx: {} bytes", qualities.len());
         (header_result?, seq_result?, qualities)
     } else {
@@ -651,12 +677,12 @@ fn humanize_bytes(bytes: usize) -> String {
     else { format!("{} B", bytes) }
 }
 
-/// Compress a single stream into 25 MB BSC blocks using rayon par_iter.
+/// Compress a single stream into BSC blocks using rayon par_iter.
 /// Blocks are shrunk to actual compressed size to avoid excess capacity
-/// (BSC allocates ~25 MB output buffers but compressed data is typically ~9 MB).
+/// (BSC allocates output buffers = input + header, but compressed data is typically ~40%).
 fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool) -> Result<Vec<Vec<u8>>> {
     use rayon::prelude::*;
-    const BSC_BLOCK_SIZE: usize = 25 * 1024 * 1024;
+    const BSC_BLOCK_SIZE: usize = 25 * 1024 * 1024; // 25 MB: matches SPRING
 
     if data.is_empty() {
         return Ok(Vec::new());
@@ -665,7 +691,7 @@ fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool) -> Result<Vec<Ve
     let compress_fn: fn(&[u8]) -> Result<Vec<u8>> = if bsc_static {
         bsc::compress
     } else {
-        bsc::compress_adaptive
+        bsc::compress_adaptive_no_lzp
     };
 
     let chunks: Vec<&[u8]> = data.chunks(BSC_BLOCK_SIZE).collect();
@@ -716,8 +742,8 @@ fn write_blocks_to_tmp(blocks: Vec<Vec<u8>>, tmp: &mut std::io::BufWriter<std::f
 /// Produces output identical to compress_streaming_bsc (same archive format,
 /// same multi-block BSC format — existing decompressor works unchanged).
 fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
-    use std::io::{Write, BufWriter};
-    const CHUNK_SIZE: usize = 5_000_000; // 5M records per chunk
+    use std::io::Write;
+    const CHUNK_SIZE: usize = 2_500_000; // 2.5M records: better I/O+compute overlap
 
     let start_time = Instant::now();
     let input_path = &args.input[0];
@@ -730,43 +756,16 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
         quality_mode_to_binning(quality_mode)
     };
 
-    info!("Chunked streaming mode: {} records per chunk, pipelined I/O", CHUNK_SIZE);
+    info!("Pipelined compression: {} records per chunk", CHUNK_SIZE);
 
     let mut reader = crate::io::FastqReader::from_path(input_path, args.fasta)?;
 
-    // Temp files for streaming compressed blocks to disk (constant memory)
-    let working_dir = &args.working_dir;
-    let h_tmp_path = working_dir.join(".qz_chunked_h.tmp");
-    let s_tmp_path = working_dir.join(".qz_chunked_s.tmp");
-    let q_tmp_path = working_dir.join(".qz_chunked_q.tmp");
+    // Accumulate compressed blocks in memory (no temp files — faster for typical inputs)
+    let mut all_h_blocks: Vec<Vec<u8>> = Vec::new();
+    let mut all_s_blocks: Vec<Vec<u8>> = Vec::new();
+    let mut all_q_blocks: Vec<Vec<u8>> = Vec::new();
+    let mut all_rc_blocks: Vec<Vec<u8>> = Vec::new();
 
-    // Cleanup guard: remove temp files on drop (handles success, error, and panic)
-    struct TmpCleanup(Vec<std::path::PathBuf>);
-    impl Drop for TmpCleanup {
-        fn drop(&mut self) {
-            for p in &self.0 {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-    let rc_tmp_path = working_dir.join(".qz_chunked_rc.tmp");
-    let mut tmp_paths = vec![h_tmp_path.clone(), s_tmp_path.clone(), q_tmp_path.clone()];
-    if args.rc_canon { tmp_paths.push(rc_tmp_path.clone()); }
-    let _cleanup = TmpCleanup(tmp_paths);
-
-    let mut h_tmp = BufWriter::new(std::fs::File::create(&h_tmp_path)?);
-    let mut s_tmp = BufWriter::new(std::fs::File::create(&s_tmp_path)?);
-    let mut q_tmp = BufWriter::new(std::fs::File::create(&q_tmp_path)?);
-    let mut rc_tmp = if args.rc_canon {
-        Some(BufWriter::new(std::fs::File::create(&rc_tmp_path)?))
-    } else {
-        None
-    };
-
-    let mut h_num_blocks: u32 = 0;
-    let mut s_num_blocks: u32 = 0;
-    let mut q_num_blocks: u32 = 0;
-    let mut rc_num_blocks: u32 = 0;
     let mut num_reads: usize = 0;
     let mut total_bases: usize = 0;
     let mut original_size: usize = 0;
@@ -784,7 +783,6 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
 
     // Decide quality_ctx usage from first chunk (must be consistent across all chunks)
     let use_quality_ctx = collect_for_ctx
-        && !cur.variable_lengths
         && (args.quality_compressor == QualityCompressor::QualityCtx
             || cur.num_reads >= MIN_READS_QUALITY_CTX);
     let quality_compressor_used = if use_quality_ctx {
@@ -794,8 +792,6 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
     };
     if use_quality_ctx {
         info!("Using context-adaptive quality compression (quality_ctx)");
-    } else if args.quality_compressor == QualityCompressor::QualityCtx && cur.variable_lengths {
-        info!("Warning: quality-ctx requires fixed-length reads, falling back to BSC");
     }
 
     while cur.num_reads > 0 {
@@ -804,10 +800,6 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
 
         // Pipeline: compress current chunk on a background thread while
         // reading the next chunk on the main thread.
-        //
-        // The compression thread processes streams SEQUENTIALLY (headers ->
-        // sequences -> qualities) to limit BSC working memory. Raw data for
-        // each stream is dropped after compression before starting the next.
         let (next_result, compress_result) = std::thread::scope(|scope| {
             let h_data = std::mem::take(&mut cur.header_stream);
             let s_data = std::mem::take(&mut cur.seq_stream);
@@ -817,30 +809,42 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
             let ss = std::mem::take(&mut cur.seq_strings);
 
             let compress_handle = scope.spawn(move || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-                // Compress headers, then free raw header data before starting sequences
-                let h_blocks = compress_stream_to_bsc_blocks(&h_data, bsc_static)?;
-                drop(h_data);
-
-                // Compress sequences, then free raw sequence data before starting qualities
-                let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static)?;
-                drop(s_data);
-
-                // Compress qualities
-                let q_blocks = if no_quality || (q_data.is_empty() && qs.is_empty()) {
-                    Vec::new()
-                } else if use_quality_ctx {
-                    drop(q_data); // Don't need packed stream
-                    let qual_refs: Vec<&str> = qs.iter().map(|s| s.as_str()).collect();
-                    let seq_refs: Vec<&str> = ss.iter().map(|s| s.as_str()).collect();
-                    let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
-                    drop(qs);
-                    drop(ss);
-                    vec![blob] // Single blob as one "block"
-                } else {
-                    drop(qs);
-                    drop(ss);
-                    compress_stream_to_bsc_blocks(&q_data, bsc_static)?
-                };
+                // Compress all three streams in parallel for speed
+                let (h_result, (s_result, q_result)) = rayon::join(
+                    || compress_stream_to_bsc_blocks(&h_data, bsc_static),
+                    || rayon::join(
+                        || compress_stream_to_bsc_blocks(&s_data, bsc_static),
+                        || -> Result<Vec<Vec<u8>>> {
+                            if no_quality || (q_data.is_empty() && qs.is_empty()) {
+                                Ok(Vec::new())
+                            } else if use_quality_ctx {
+                                use rayon::prelude::*;
+                                drop(q_data); // Don't need packed stream
+                                let qual_refs: Vec<&str> = qs.iter().map(|s| s.as_str()).collect();
+                                let seq_refs: Vec<&str> = ss.iter().map(|s| s.as_str()).collect();
+                                const SUB_BLOCK_READS: usize = 500_000;
+                                let n = qual_refs.len();
+                                if n <= SUB_BLOCK_READS {
+                                    let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
+                                    Ok(vec![blob])
+                                } else {
+                                    let num_sub = (n + SUB_BLOCK_READS - 1) / SUB_BLOCK_READS;
+                                    let blobs: Vec<Vec<u8>> = (0..num_sub)
+                                        .into_par_iter()
+                                        .map(|i| {
+                                            let start = i * SUB_BLOCK_READS;
+                                            let end = (start + SUB_BLOCK_READS).min(n);
+                                            quality_ctx::compress_qualities_ctx(&qual_refs[start..end], &seq_refs[start..end])
+                                        })
+                                        .collect::<Result<Vec<_>>>()?;
+                                    Ok(blobs)
+                                }
+                            } else {
+                                compress_stream_to_bsc_blocks(&q_data, bsc_static)
+                            }
+                        },
+                    ),
+                );
 
                 // Compress RC flags (if present)
                 let rc_blocks = if rc_data.is_empty() {
@@ -849,7 +853,7 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
                     compress_stream_to_bsc_blocks(&rc_data, bsc_static)?
                 };
 
-                Ok((h_blocks, s_blocks, q_blocks, rc_blocks))
+                Ok((h_result?, s_result?, q_result?, rc_blocks))
             });
 
             // Read next chunk on main thread (overlaps with compression)
@@ -863,13 +867,13 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
             (next, compressed)
         });
 
-        // Write compressed blocks to temp files immediately, freeing block memory
+        // Accumulate compressed blocks in memory (instant, no disk I/O)
         let (h_blk, s_blk, q_blk, rc_blk) = compress_result?;
-        h_num_blocks += write_blocks_to_tmp(h_blk, &mut h_tmp)?;
-        s_num_blocks += write_blocks_to_tmp(s_blk, &mut s_tmp)?;
-        q_num_blocks += write_blocks_to_tmp(q_blk, &mut q_tmp)?;
-        if let Some(ref mut rc_file) = rc_tmp {
-            rc_num_blocks += write_blocks_to_tmp(rc_blk, rc_file)?;
+        all_h_blocks.extend(h_blk);
+        all_s_blocks.extend(s_blk);
+        all_q_blocks.extend(q_blk);
+        if rc_canon {
+            all_rc_blocks.extend(rc_blk);
         }
 
         num_reads += cur.num_reads;
@@ -880,48 +884,88 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
         cur = next_result?;
     }
 
-    // Flush and close temp file writers
-    h_tmp.flush()?;
-    s_tmp.flush()?;
-    q_tmp.flush()?;
-    if let Some(ref mut rc_file) = rc_tmp {
-        rc_file.flush()?;
-    }
-    drop(h_tmp);
-    drop(s_tmp);
-    drop(q_tmp);
-    drop(rc_tmp);
+    // Compute stream sizes in multi-block format
+    let h_data_size: usize = all_h_blocks.iter().map(|b| 4 + b.len()).sum();
+    let s_data_size: usize = all_s_blocks.iter().map(|b| 4 + b.len()).sum();
+    let q_data_size: usize = all_q_blocks.iter().map(|b| 4 + b.len()).sum();
+    let rc_data_size: usize = all_rc_blocks.iter().map(|b| 4 + b.len()).sum();
 
-    let h_tmp_size = std::fs::metadata(&h_tmp_path)?.len() as usize;
-    let s_tmp_size = std::fs::metadata(&s_tmp_path)?.len() as usize;
-    let q_tmp_size = std::fs::metadata(&q_tmp_path)?.len() as usize;
-    let rc_tmp_size = if rc_canon { std::fs::metadata(&rc_tmp_path)?.len() as usize } else { 0 };
-
-    // Stream sizes in multi-block format: [num_blocks: u32] + block data from temp file
-    let headers_len = if h_num_blocks > 0 { 4 + h_tmp_size } else { 0 };
-    let sequences_len = if s_num_blocks > 0 { 4 + s_tmp_size } else { 0 };
-    let qualities_len = if q_num_blocks > 0 { 4 + q_tmp_size } else { 0 };
-    let rc_flags_len = if rc_num_blocks > 0 { 4 + rc_tmp_size } else { 0 };
+    let headers_len = if !all_h_blocks.is_empty() { 4 + h_data_size } else { 0 };
+    let sequences_len = if !all_s_blocks.is_empty() { 4 + s_data_size } else { 0 };
+    let qualities_len = if !all_q_blocks.is_empty() { 4 + q_data_size } else { 0 };
+    let rc_flags_len = if !all_rc_blocks.is_empty() { 4 + rc_data_size } else { 0 };
 
     info!("Read {} records in {} chunks ({} bases)", num_reads, chunk_idx, total_bases);
     info!("Compressed blocks: headers={} ({}) seq={} ({}) qual={} ({})",
-        h_num_blocks, humanize_bytes(h_tmp_size),
-        s_num_blocks, humanize_bytes(s_tmp_size),
-        q_num_blocks, humanize_bytes(q_tmp_size));
+        all_h_blocks.len(), humanize_bytes(h_data_size),
+        all_s_blocks.len(), humanize_bytes(s_data_size),
+        all_q_blocks.len(), humanize_bytes(q_data_size));
     if rc_canon {
-        info!("  RC flags: {} ({})", rc_num_blocks, humanize_bytes(rc_tmp_size));
+        info!("  RC flags: {} ({})", all_rc_blocks.len(), humanize_bytes(rc_data_size));
     }
 
-    // Write final output
+    // Write final archive directly from memory (no temp file copy)
+    info!("Writing output file...");
     let encoding_type: u8 = if rc_canon { 6 } else if args.sequence_delta { 5 } else if args.sequence_hints { 4 } else { 0 };
-    write_chunked_archive_rc(
-        &args.output, quality_binning, quality_compressor_used, no_quality, encoding_type,
-        num_reads, headers_len, sequences_len, qualities_len, rc_flags_len,
-        h_num_blocks, s_num_blocks, q_num_blocks, rc_num_blocks,
-        &h_tmp_path, &s_tmp_path, &q_tmp_path, &rc_tmp_path,
-        original_size, start_time,
-    )
-    // Temp files cleaned up by TmpCleanup drop guard
+    let mut output_file = std::fs::File::create(&args.output)?;
+
+    output_file.write_all(&[encoding_type])?;
+    output_file.write_all(&[0u8])?;                                             // arithmetic = disabled
+    output_file.write_all(&[binning_to_code(quality_binning)])?;
+    output_file.write_all(&[compressor_to_code(quality_compressor_used)])?;
+    output_file.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?;
+    output_file.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;
+    output_file.write_all(&[0u8])?;                                             // quality_model = disabled
+    output_file.write_all(&[0u8])?;                                             // quality_delta = disabled
+    output_file.write_all(&[0u8])?;                                             // quality_dict = disabled
+    output_file.write_all(&0u16.to_le_bytes())?;                                // template_prefix_len = 0
+    output_file.write_all(&[0u8])?;                                             // has_comment = false
+
+    output_file.write_all(&(num_reads as u64).to_le_bytes())?;
+    output_file.write_all(&(headers_len as u64).to_le_bytes())?;
+    output_file.write_all(&(sequences_len as u64).to_le_bytes())?;
+    output_file.write_all(&0u64.to_le_bytes())?;                                // nmasks_len = 0
+    output_file.write_all(&(if no_quality { 0 } else { qualities_len } as u64).to_le_bytes())?;
+
+    // Write streams in multi-block format: [num_blocks: u32][block_len: u32, block_data]...
+    let write_blocks = |blocks: &[Vec<u8>], out: &mut std::fs::File| -> Result<()> {
+        if blocks.is_empty() { return Ok(()); }
+        out.write_all(&(blocks.len() as u32).to_le_bytes())?;
+        for block in blocks {
+            out.write_all(&(block.len() as u32).to_le_bytes())?;
+            out.write_all(block)?;
+        }
+        Ok(())
+    };
+
+    write_blocks(&all_h_blocks, &mut output_file)?;
+    write_blocks(&all_s_blocks, &mut output_file)?;
+    write_blocks(&all_q_blocks, &mut output_file)?;
+
+    // Append RC flags stream after qualities (encoding_type=6 signals its presence)
+    if !all_rc_blocks.is_empty() {
+        output_file.write_all(&(rc_flags_len as u64).to_le_bytes())?;
+        write_blocks(&all_rc_blocks, &mut output_file)?;
+    }
+
+    let metadata_size = 9 + 2 + 1 + 40 + if !all_rc_blocks.is_empty() { 8 } else { 0 };
+    let total_compressed = headers_len + sequences_len + qualities_len + rc_flags_len + metadata_size;
+
+    let elapsed = start_time.elapsed();
+    info!("Compression completed in {:.2}s", elapsed.as_secs_f64());
+    info!("Original size: {} bytes", original_size);
+    info!("Compressed size: {} bytes", total_compressed);
+    info!("Compression ratio: {:.2}x", original_size as f64 / total_compressed as f64);
+    info!("Stream breakdown:");
+    info!("  Headers:   {} bytes ({:.1}%)", headers_len, 100.0 * headers_len as f64 / total_compressed as f64);
+    info!("  Sequences: {} bytes ({:.1}%)", sequences_len, 100.0 * sequences_len as f64 / total_compressed as f64);
+    info!("  Qualities: {} bytes ({:.1}%)", qualities_len, 100.0 * qualities_len as f64 / total_compressed as f64);
+    if rc_flags_len > 0 {
+        info!("  RC flags:  {} bytes ({:.1}%)", rc_flags_len, 100.0 * rc_flags_len as f64 / total_compressed as f64);
+    }
+    info!("  Metadata:  {} bytes ({:.1}%)", metadata_size, 100.0 * metadata_size as f64 / total_compressed as f64);
+
+    Ok(())
 }
 
 /// Chunked streaming compression with local reordering within each chunk.
@@ -1732,11 +1776,12 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
         }
     }
 
-    // Validate --local-reorder / --ultra compatibility
-    if args.local_reorder || args.ultra {
-        let mode_name = if args.local_reorder { "--local-reorder" } else { "--ultra" };
-        if args.local_reorder && args.ultra {
-            anyhow::bail!("--local-reorder and --ultra cannot be combined");
+    // Validate --local-reorder / --ultra / --fast-ultra compatibility
+    let has_ultra = args.ultra.is_some();
+    if args.local_reorder || has_ultra || args.fast_ultra {
+        let mode_name = if args.local_reorder { "--local-reorder" } else if args.fast_ultra { "--fast-ultra" } else { "--ultra" };
+        if (args.local_reorder as u8 + has_ultra as u8 + args.fast_ultra as u8) > 1 {
+            anyhow::bail!("--local-reorder, --ultra, and --fast-ultra cannot be combined");
         }
         if args.factorize || args.delta_encoding || args.rle_encoding || args.debruijn
             || args.arithmetic || args.sequence_hints || args.sequence_delta || args.rc_canon {
@@ -1797,9 +1842,16 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
         return harc::compress_harc(args);
     }
 
-    // Ultra mode: single large BSC block with parallel BWT (best ratio)
-    if args.ultra {
-        return harc::compress_reorder_local(args);
+    // Ultra mode: level-based compression with auto-tuning
+    if let Some(requested_level) = args.ultra {
+        let level = harc::resolve_ultra_level(requested_level);
+        return harc::compress_reorder_local_with_level(args, level);
+    }
+
+    // Backwards compat: --fast-ultra maps to ultra level 2
+    if args.fast_ultra {
+        let level = harc::resolve_ultra_level(2);
+        return harc::compress_reorder_local_with_level(args, level);
     }
 
     // Fqzcomp quality needs record-level access, so use chunked record-based path
@@ -1808,11 +1860,10 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
     }
 
     if can_stream {
-        // RC canon always uses chunked path (needs temp file for flags stream)
-        if args.chunked || args.rc_canon {
-            return compress_chunked_bsc(args);
-        }
-        return compress_streaming_bsc(args);
+        // Always use chunked pipeline: pipelined I/O (read next chunk while
+        // compressing current), parallel h||s||q compression, sub-block
+        // quality_ctx parallelism, and bounded memory via temp files.
+        return compress_chunked_bsc(args);
     }
 
     // Non-streaming mode: read all records into memory first

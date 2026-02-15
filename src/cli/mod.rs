@@ -164,10 +164,19 @@ pub struct CompressArgs {
     #[arg(long)]
     pub local_reorder: bool,
 
-    /// Ultra compression: single large BSC block with parallel BWT.
-    /// Best compression ratio (~8.2x) but slower and higher memory than default.
-    #[arg(long)]
-    pub ultra: bool,
+    /// Ultra compression with optional level (1-5, default: auto).
+    /// Level 1: fast (1M chunks, ~8 GB RAM)
+    /// Level 2: balanced (2M chunks, ~11 GB RAM)
+    /// Level 3: high (5M chunks, ~17 GB RAM)
+    /// Level 4: max (8M chunks, ~26 GB RAM)
+    /// Level 5: extreme (10M chunks, ~17 GB RAM)
+    /// Auto mode selects the highest level that fits available RAM and cores.
+    #[arg(long, value_name = "LEVEL", default_missing_value = "0", num_args = 0..=1)]
+    pub ultra: Option<u8>,
+
+    /// Deprecated: use --ultra 2 instead.
+    #[arg(long, hide = true)]
+    pub fast_ultra: bool,
 }
 
 impl Default for CompressArgs {
@@ -204,7 +213,8 @@ impl Default for CompressArgs {
             sequence_delta: false,
             factorize: false,
             local_reorder: false,
-            ultra: false,
+            ultra: None,
+            fast_ultra: false,
         }
     }
 }

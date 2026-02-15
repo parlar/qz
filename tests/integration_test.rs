@@ -1054,7 +1054,7 @@ fn test_ultra_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        ultra: true,
+        ultra: Some(3),
         ..CompressArgs::default()
     };
 
@@ -1125,6 +1125,52 @@ fn test_quality_ctx_roundtrip() {
     let original = fs::read_to_string(&input_fastq).unwrap();
     let decompressed = fs::read_to_string(&output_fastq).unwrap();
 
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
+    for (i, (o, d)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
+        assert_eq!(o, d, "mismatch at line {}", i);
+    }
+}
+
+#[test]
+fn test_quality_ctx_variable_length_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Variable-length reads: 20bp, 32bp, 15bp, 40bp, 32bp
+    let test_data = "\
+@read0\nACGTACGTACGTACGTACGT\n+\nIIHHJJBBCCDDEEFFIIHH\n\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIHHJJBBCCDDEEFFIIHHJJBBCCDDEEFF\n\
+@read2\nACGTACGTACGTACG\n+\nIIHHJJBBCCDDEEF\n\
+@read3\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIHHJJBBCCDDEEFFIIHHJJBBCCDDEEFFIIHHJJBB\n\
+@read4\nTTTGGGCCCAAAGGGTTTGGGCCCAAAGGGTT\n+\nBBBBAAAABBBBAAAABBBBAAAABBBBAAAABB\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        quality_compressor: QualityCompressor::QualityCtx,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    // Verify archive uses QualityCtx (not fallen back to BSC)
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[3], 4, "quality_compressor should be 4 (QualityCtx), not BSC fallback");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
     let orig_lines: Vec<&str> = original.lines().collect();
     let decomp_lines: Vec<&str> = decompressed.lines().collect();
     assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
