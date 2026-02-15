@@ -19,7 +19,7 @@ pub mod quality_context;
 pub mod openzl;
 pub mod template;
 mod factorize;
-mod harc;
+mod ultra;
 mod quality_ctx;
 
 use crate::cli::{CompressArgs, DecompressArgs, QualityMode, QualityCompressor, SequenceCompressor, HeaderCompressor};
@@ -809,13 +809,15 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
             let ss = std::mem::take(&mut cur.seq_strings);
 
             let compress_handle = scope.spawn(move || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+                let chunk_t0 = Instant::now();
                 // Compress all three streams in parallel for speed
                 let (h_result, (s_result, q_result)) = rayon::join(
-                    || compress_stream_to_bsc_blocks(&h_data, bsc_static),
+                    || { let t = Instant::now(); let r = compress_stream_to_bsc_blocks(&h_data, bsc_static); info!("  BSC headers: {:.2}s", t.elapsed().as_secs_f64()); r },
                     || rayon::join(
-                        || compress_stream_to_bsc_blocks(&s_data, bsc_static),
+                        || { let t = Instant::now(); let r = compress_stream_to_bsc_blocks(&s_data, bsc_static); info!("  BSC sequences: {:.2}s", t.elapsed().as_secs_f64()); r },
                         || -> Result<Vec<Vec<u8>>> {
-                            if no_quality || (q_data.is_empty() && qs.is_empty()) {
+                            let qt = Instant::now();
+                            let qr = if no_quality || (q_data.is_empty() && qs.is_empty()) {
                                 Ok(Vec::new())
                             } else if use_quality_ctx {
                                 use rayon::prelude::*;
@@ -841,7 +843,9 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
                                 }
                             } else {
                                 compress_stream_to_bsc_blocks(&q_data, bsc_static)
-                            }
+                            };
+                            info!("  Quality: {:.2}s", qt.elapsed().as_secs_f64());
+                            qr
                         },
                     ),
                 );
@@ -853,15 +857,18 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
                     compress_stream_to_bsc_blocks(&rc_data, bsc_static)?
                 };
 
+                info!("  Chunk compress total: {:.2}s", chunk_t0.elapsed().as_secs_f64());
                 Ok((h_result?, s_result?, q_result?, rc_blocks))
             });
 
             // Read next chunk on main thread (overlaps with compression)
+            let io_t = Instant::now();
             let next = read_chunk_streams(
                 &mut reader, CHUNK_SIZE, quality_mode, quality_binning, no_quality,
                 args.sequence_hints, args.sequence_delta, rc_canon,
                 collect_for_ctx && use_quality_ctx,
             );
+            info!("  I/O read: {:.2}s", io_t.elapsed().as_secs_f64());
 
             let compressed = compress_handle.join().unwrap();
             (next, compressed)
@@ -1839,19 +1846,19 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
 
     // Local reorder mode: center-hash grouping + delta encoding
     if args.local_reorder {
-        return harc::compress_harc(args);
+        return ultra::compress_harc(args);
     }
 
     // Ultra mode: level-based compression with auto-tuning
     if let Some(requested_level) = args.ultra {
-        let level = harc::resolve_ultra_level(requested_level);
-        return harc::compress_reorder_local_with_level(args, level);
+        let level = ultra::resolve_ultra_level(requested_level);
+        return ultra::compress_reorder_local_with_level(args, level);
     }
 
     // Backwards compat: --fast-ultra maps to ultra level 2
     if args.fast_ultra {
-        let level = harc::resolve_ultra_level(2);
-        return harc::compress_reorder_local_with_level(args, level);
+        let level = ultra::resolve_ultra_level(2);
+        return ultra::compress_reorder_local_with_level(args, level);
     }
 
     // Fqzcomp quality needs record-level access, so use chunked record-based path
@@ -3150,11 +3157,11 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
         let (header_result, seq_result) = rayon::join(
             || decompress_headers_bsc(headers, num_reads)
                 .context("Failed to decompress headers"),
-            || -> Result<harc::HarcDecoded> {
+            || -> Result<ultra::HarcDecoded> {
                 if encoding_type == 8 {
-                    harc::decode_harc_sequences(sequences, num_reads)
+                    ultra::decode_harc_sequences(sequences, num_reads)
                 } else {
-                    harc::decode_reorder_local(sequences, num_reads)
+                    ultra::decode_reorder_local(sequences, num_reads)
                 }
             },
         );

@@ -964,6 +964,8 @@ fn compress_chunk(
 
                     // BSC compress each seq stream. Split large streams into
                     // <=750MB blocks to stay within libsais's working limits.
+                    // LZP enabled: reduces data before BWT even for DNA (~25% hit
+                    // rate), making the expensive BWT sort faster overall.
                     const MAX_BSC_BLOCK: usize = 750 * 1024 * 1024;
                     use rayon::prelude::*;
                     let compressed_blocks: Vec<Vec<Vec<u8>>> = seq_streams.into_par_iter().map(|data| {

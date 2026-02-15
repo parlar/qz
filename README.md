@@ -82,7 +82,6 @@ qz compress -i large.fastq -o large.qz --chunked
 
 # Limit threads
 qz compress -i reads.fastq -o reads.qz -t 8
-```
 
 # Auto-select ultra level
 qz compress -i reads.fastq -o reads.qz --ultra
@@ -259,6 +258,22 @@ Each stream is split into **25 MB blocks** that are compressed independently and
 ### Chunked Streaming
 
 For files that exceed available memory, `--chunked` mode reads in 5 M-record chunks and pipelines I/O with compression. Temporary files keep memory constant regardless of input size — peak usage is ~6 GB for 100 M reads on 72 threads.
+
+## Benchmarks
+
+10 million reads, 150 bp whole-genome sequencing (ERR3239334), 3,491 MB input. All tools verified byte-identical roundtrip. 72-core machine, sequential runs (no concurrent load).
+
+| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
+|------|-----------|-------|----------|----------|------------|---------|
+| **QZ default** | 446 | **7.83x** | 17.4 s | 5.5 GB | 14.8 s | 7.2 GB |
+| **QZ ultra 3** | 416 | **8.40x** | 37.0 s | 16.1 GB | 22.0 s | 8.5 GB |
+| SPRING (no reorder) | 431 | 8.10x | 1:02.5 | 12.1 GB | 17.9 s | 10.0 GB |
+| bzip2 -9 | 542 | 6.44x | 2:49.6 | 7.3 MB | 1:30.6 | 4.5 MB |
+| pigz -9 | 695 | 5.02x | 9.7 s | 21.9 MB | 8.0 s | 1.7 MB |
+
+- **QZ default**: pipelined chunked mode (2.5M reads/chunk), BSC adaptive without LZP
+- **QZ ultra 3**: 5M reads/chunk (2 parallel), BSC adaptive with LZP, OpenMP BWT
+- **SPRING**: local reorder only (`--no-ids`), SPRING reorders reads internally so roundtrip is verified by decompression only
 
 ## Environment Variables
 

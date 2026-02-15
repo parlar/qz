@@ -9,6 +9,11 @@ use anyhow::Result;
 use libc::{c_int, c_uchar};
 use std::sync::Once;
 
+// OpenMP thread control
+unsafe extern "C" {
+    fn omp_set_num_threads(num_threads: c_int);
+}
+
 // Error codes from libbsc
 const LIBBSC_NO_ERROR: c_int = 0;
 const _LIBBSC_BAD_PARAMETER: c_int = -1;
@@ -85,6 +90,9 @@ fn ensure_initialized() {
     });
 }
 
+/// Max OpenMP threads for BSC-internal multithreading (compress_adaptive_mt only).
+const BSC_MT_THREADS: c_int = 12;
+
 /// Compress data using BSC (matching official SPRING settings)
 /// Official SPRING uses -p flag which disables LZP preprocessing
 pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
@@ -146,10 +154,19 @@ pub fn compress_parallel_adaptive_no_lzp(data: &[u8]) -> Result<Vec<u8>> {
     compress_parallel_with(data, compress_adaptive_no_lzp)
 }
 
-/// Compress using adaptive coder with BSC-internal multithreading (OpenMP).
-/// Use this for single large blocks where rayon can't parallelize across blocks.
-/// No LZP — DNA data doesn't benefit from it (BWT captures patterns).
+/// Compress using adaptive coder with BSC-internal multithreading (OpenMP) and LZP.
+/// Best for structured non-DNA streams (order indices, read lengths) where LZP helps.
 pub fn compress_adaptive_mt(data: &[u8]) -> Result<Vec<u8>> {
+    compress_mt_inner(data, 16, 128)
+}
+
+/// Compress using adaptive coder with BSC-internal multithreading, no LZP.
+/// Best for raw DNA streams where LZP adds overhead without helping.
+pub fn compress_adaptive_mt_no_lzp(data: &[u8]) -> Result<Vec<u8>> {
+    compress_mt_inner(data, 0, 0)
+}
+
+fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Result<Vec<u8>> {
     ensure_initialized();
 
     if data.is_empty() {
@@ -159,12 +176,14 @@ pub fn compress_adaptive_mt(data: &[u8]) -> Result<Vec<u8>> {
     let mut output = vec![0u8; data.len() + LIBBSC_HEADER_SIZE + 1024];
 
     let compressed_size = unsafe {
+        // Limit OpenMP threads per BSC call (only affects MT path, not default rayon path)
+        omp_set_num_threads(BSC_MT_THREADS);
         bsc_compress(
             data.as_ptr(),
             output.as_mut_ptr(),
             data.len() as c_int,
-            0,   // lzp_hash_size (disabled)
-            0,   // lzp_min_len (disabled)
+            lzp_hash_size as c_int,
+            lzp_min_len as c_int,
             LIBBSC_BLOCKSORTER_BWT,
             LIBBSC_CODER_QLFC_ADAPTIVE,
             LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING,
@@ -302,6 +321,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decompress with BSC-internal multithreading (OpenMP parallel inverse BWT).
 pub fn decompress_mt(data: &[u8]) -> Result<Vec<u8>> {
+    unsafe { omp_set_num_threads(BSC_MT_THREADS); }
     decompress_with_features(data, LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING)
 }
 
