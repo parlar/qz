@@ -22,6 +22,8 @@ fn main() {
         .flag_if_supported("-O3")
         .flag_if_supported("-std=c++11")
         .flag_if_supported("-fopenmp") // For multithreading support
+        .define("LIBBSC_OPENMP_SUPPORT", None) // Enable BSC's OpenMP code paths
+        .define("LIBSAIS_OPENMP", None)        // Enable libsais parallel BWT
         .include("third_party/libbsc/libbsc")
         .include("third_party/libbsc/libbsc/bwt/libsais") // For libsais headers
         .warnings(false) // Suppress warnings from third-party code
@@ -42,8 +44,18 @@ fn main() {
 
     println!("cargo:rerun-if-changed=third_party/htscodecs/htscodecs");
 
-    // Link OpenMP for multithreading (if available)
-    println!("cargo:rustc-link-lib=gomp"); // GNU OpenMP
+    // Link OpenMP for multithreading
+    // Pass both -L and -lgomp as link-args so they appear together
+    // after -Bdynamic in the link command (rust-lld needs this)
+    for entry in std::fs::read_dir("/usr/lib/gcc/x86_64-linux-gnu").into_iter().flatten() {
+        if let Ok(e) = entry {
+            if e.path().join("libgomp.so").exists() {
+                println!("cargo:rustc-link-arg=-L{}", e.path().display());
+            }
+        }
+    }
+    println!("cargo:rustc-link-arg=-lgomp");
+    println!("cargo:rustc-link-arg=-lstdc++");
     // Link math lib for htscodecs (log, etc.)
     println!("cargo:rustc-link-lib=m");
 }

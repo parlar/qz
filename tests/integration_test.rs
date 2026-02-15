@@ -986,3 +986,149 @@ fn test_factorize_roundtrip() {
         assert_eq!(orig.trim(), decomp.trim(), "mismatch at line {}", i);
     }
 }
+
+#[test]
+fn test_local_reorder_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read3\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read4\nGGGGCCCCAAAATTTTGGGGCCCCAAAATTTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read5\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read6\nTGCATGCATGCATGCATGCATGCATGCATGCT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        local_reorder: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[0], 8, "encoding_type should be 8 for local-reorder");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+    assert!(output_fastq.exists());
+
+    // Local reorder restores original order — verify exact match
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
+    for (i, (o, d)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
+        assert_eq!(o, d, "mismatch at line {}", i);
+    }
+}
+
+#[test]
+fn test_ultra_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    let test_data = "\
+@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read2\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
+@read3\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read4\nGGGGCCCCAAAATTTTGGGGCCCCAAAATTTT\n+\nFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\n\
+@read5\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@read6\nTGCATGCATGCATGCATGCATGCATGCATGCT\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n";
+    fs::write(&input_fastq, test_data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ultra: true,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[0], 9, "encoding_type should be 9 for ultra");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+    assert!(output_fastq.exists());
+
+    // Ultra preserves original order — verify exact match
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
+    for (i, (o, d)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
+        assert_eq!(o, d, "mismatch at line {}", i);
+    }
+}
+
+#[test]
+fn test_quality_ctx_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("test_input.fastq");
+    // Generate 20 fixed-length reads (quality_ctx requires fixed length)
+    let mut test_data = String::new();
+    let seq_base = "ACGTACGTACGTACGTACGTACGTACGTACGT"; // 32bp
+    let qual_base = "IIHHJJBBCCDDEEFFIIHHJJBBCCDDEEFF"; // 32 chars
+    assert_eq!(seq_base.len(), 32);
+    assert_eq!(qual_base.len(), 32);
+    for i in 0..20 {
+        // Rotate sequence to get variety
+        let rot = i % seq_base.len();
+        let seq: String = seq_base.bytes().cycle().skip(rot).take(32).map(|b| b as char).collect();
+        test_data.push_str(&format!("@read{}\n{}\n+\n{}\n", i, seq, qual_base));
+    }
+    fs::write(&input_fastq, &test_data).unwrap();
+
+    // Force quality_ctx (bypasses the 100K-read auto-selection threshold)
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressArgs {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        quality_compressor: QualityCompressor::QualityCtx,
+        ..CompressArgs::default()
+    };
+
+    qz::compression::compress(&compress_args).unwrap();
+    assert!(archive_path.exists());
+
+    // Verify archive header has quality_compressor = 4 (QualityCtx)
+    let archive_data = fs::read(&archive_path).unwrap();
+    assert_eq!(archive_data[3], 4, "quality_compressor code should be 4 (QualityCtx)");
+
+    let output_fastq = temp_path.join("decompressed.fastq");
+    qz::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
+
+    assert!(output_fastq.exists());
+
+    let original = fs::read_to_string(&input_fastq).unwrap();
+    let decompressed = fs::read_to_string(&output_fastq).unwrap();
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let decomp_lines: Vec<&str> = decompressed.lines().collect();
+    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
+    for (i, (o, d)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
+        assert_eq!(o, d, "mismatch at line {}", i);
+    }
+}

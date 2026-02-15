@@ -153,11 +153,21 @@ pub struct CompressArgs {
     #[arg(long)]
     pub sequence_delta: bool,
 
-    /// Factorized sequence compression: two-pass inverted-index delta encoding
-    /// with separate metadata stream. Uses syncmer-based matching within each chunk
-    /// to find similar reads and encode them as deltas, without reordering.
+    /// Two-pass pattern routing: scan first 5M reads to learn frequent syncmer patterns,
+    /// then route reads to pattern-specific sequence streams for better BWT compression.
     #[arg(long)]
     pub factorize: bool,
+
+    /// Local reordering with delta encoding: group similar reads by center-hash,
+    /// encode each as a delta against the previous read.
+    /// Restores original order on decompress.
+    #[arg(long)]
+    pub local_reorder: bool,
+
+    /// Ultra compression: single large BSC block with parallel BWT.
+    /// Best compression ratio (~8.2x) but slower and higher memory than default.
+    #[arg(long)]
+    pub ultra: bool,
 }
 
 impl Default for CompressArgs {
@@ -193,6 +203,8 @@ impl Default for CompressArgs {
             sequence_hints: false,
             sequence_delta: false,
             factorize: false,
+            local_reorder: false,
+            ultra: false,
         }
     }
 }
@@ -225,7 +237,7 @@ pub struct DecompressArgs {
 
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 pub enum QualityMode {
     /// Lossless quality preservation
     Lossless,
@@ -252,6 +264,9 @@ pub enum QualityCompressor {
     OpenZl,
     /// fqzcomp context-modeled compression with mean-quality reordering (~8% smaller than BSC)
     Fqzcomp,
+    /// Context-adaptive range coding (~7% smaller than BSC, requires fixed-length reads)
+    #[value(name = "quality-ctx")]
+    QualityCtx,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]

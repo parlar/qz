@@ -24,8 +24,9 @@ const _LIBBSC_BLOCKSORTER_ST7: c_int = 7;  // ST7 is what SPRING uses
 const LIBBSC_CODER_QLFC_STATIC: c_int = 1;
 const LIBBSC_CODER_QLFC_ADAPTIVE: c_int = 2;
 
-// Features
+// Features (bitmask)
 const LIBBSC_FEATURE_FASTMODE: c_int = 1;
+const LIBBSC_FEATURE_MULTITHREADING: c_int = 2;
 
 // Header size
 const LIBBSC_HEADER_SIZE: usize = 28;
@@ -75,7 +76,8 @@ static BSC_INIT: Once = Once::new();
 fn ensure_initialized() {
     BSC_INIT.call_once(|| {
         unsafe {
-            let result = bsc_init(LIBBSC_FEATURE_FASTMODE);
+            // Init with both features so we can use either per-call
+            let result = bsc_init(LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING);
             if result != LIBBSC_NO_ERROR {
                 eprintln!("Warning: BSC initialization failed with code {}", result);
             }
@@ -130,6 +132,38 @@ pub fn compress_with_params(
 /// Compress using adaptive coder (better compression, slightly slower)
 pub fn compress_adaptive(data: &[u8]) -> Result<Vec<u8>> {
     compress_with_params(data, 16, 128, LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE)
+}
+
+/// Compress using adaptive coder with BSC-internal multithreading (OpenMP).
+/// Use this for single large blocks where rayon can't parallelize across blocks.
+pub fn compress_adaptive_mt(data: &[u8]) -> Result<Vec<u8>> {
+    ensure_initialized();
+
+    if data.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut output = vec![0u8; data.len() + LIBBSC_HEADER_SIZE + 1024];
+
+    let compressed_size = unsafe {
+        bsc_compress(
+            data.as_ptr(),
+            output.as_mut_ptr(),
+            data.len() as c_int,
+            16,  // lzp_hash_size
+            128, // lzp_min_len
+            LIBBSC_BLOCKSORTER_BWT,
+            LIBBSC_CODER_QLFC_ADAPTIVE,
+            LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING,
+        )
+    };
+
+    if compressed_size < 0 {
+        anyhow::bail!("BSC compression failed with error code: {}", compressed_size);
+    }
+
+    output.truncate(compressed_size as usize);
+    Ok(output)
 }
 
 /// Internal helper: compress data by splitting into blocks and compressing each in parallel.
@@ -250,6 +284,15 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decompress BSC-compressed data
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_with_features(data, LIBBSC_FEATURE_FASTMODE)
+}
+
+/// Decompress with BSC-internal multithreading (OpenMP parallel inverse BWT).
+pub fn decompress_mt(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_with_features(data, LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING)
+}
+
+fn decompress_with_features(data: &[u8], features: c_int) -> Result<Vec<u8>> {
     ensure_initialized();
 
     if data.is_empty() {
@@ -260,7 +303,6 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         anyhow::bail!("BSC: compressed data too small (need at least {} bytes for header)", LIBBSC_HEADER_SIZE);
     }
 
-    // Get the decompressed size from the block header
     let mut block_size: c_int = 0;
     let mut data_size: c_int = 0;
 
@@ -270,7 +312,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
             data.len() as c_int,
             &mut block_size,
             &mut data_size,
-            LIBBSC_FEATURE_FASTMODE,
+            features,
         )
     };
 
@@ -282,7 +324,6 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         anyhow::bail!("BSC: invalid decompressed size: {}", data_size);
     }
 
-    // Allocate output buffer
     let mut output = vec![0u8; data_size as usize];
 
     let decompress_result = unsafe {
@@ -291,7 +332,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
             data.len() as c_int,
             output.as_mut_ptr(),
             data_size,
-            LIBBSC_FEATURE_FASTMODE,
+            features,
         )
     };
 

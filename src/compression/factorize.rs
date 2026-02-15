@@ -1,27 +1,75 @@
-/// Chunked read-to-read delta compression with inverted index and split streams.
+/// Two-pass pattern routing for sequence compression.
 ///
-/// For each 5M-record chunk:
-///   Pass 1: Build inverted index mapping canonical k-mer hashes to read indices.
-///   Pass 2: For each read (in order), find the best earlier match via the index,
-///           encode as delta (0x00=match, actual base=mismatch) or raw.
+/// Pass 1: Scan first N reads to learn globally frequent syncmer hash patterns.
+/// Pass 2: Route each read's sequence to main or pattern stream based on hash match.
+///         The pattern stream gets all reads matching ANY learned pattern — BWT
+///         compresses one larger block more efficiently than 100 tiny blocks.
 ///
-/// Three separate sequence sub-streams for optimal BWT compression:
-///   - meta: class byte (0=raw, 1=fwd delta, 2=rc delta) + varint(ref_index) for deltas
-///   - raw_seq: raw reads only (pure DNA — optimal BWT context)
-///   - delta_seq: delta reads only (mostly 0x00 — compresses extremely well)
-///
-/// Streams are written to temp files per chunk (bounded memory), then assembled into archive.
+/// Archive format (encoding_type=7, version=2):
+///   sequences region = [version:1B][num_patterns:1B]
+///     [routing_len:8B][routing_data]          // BSC-compressed, 1 byte per read (0=main, 1=pattern)
+///     [main_seq_len:8B][main_seq_blocks]      // multi-block BSC
+///     [pattern_seq_len:8B][pattern_seq_blocks] // single combined stream, multi-block BSC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use rustc_hash::FxHashMap;
 use tracing::info;
 use std::time::Instant;
 
 use super::*;
 
+const SCAN_LIMIT: usize = 5_000_000;
+const MAX_PATTERNS: usize = 100;
+const MIN_PATTERN_COUNT: usize = 50;
 const CHUNK_SIZE: usize = 5_000_000;
-const INDEX_K: usize = 21;
-const INDEX_STRIDE: usize = 15;
-const BUCKET_CAP: usize = 64;
+/// Version byte for the new pattern routing format (distinguishes from old factorize v1).
+const FORMAT_VERSION: u8 = 2;
+
+// ── Pass 1: Learn patterns ──────────────────────────────────────────────
+
+/// Scan first `scan_limit` reads and return the top frequent syncmer hashes.
+fn learn_patterns<R: std::io::BufRead>(
+    reader: &mut crate::io::FastqReader<R>,
+    scan_limit: usize,
+    min_count: usize,
+    max_patterns: usize,
+) -> Result<Vec<u64>> {
+    let mut hash_counts: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(2_000_000, Default::default());
+    let mut scanned = 0usize;
+
+    for _ in 0..scan_limit {
+        match reader.next()? {
+            Some(record) => {
+                let hash = dna_utils::compute_min_syncmer_hash(record.sequence.as_bytes());
+                if hash != u64::MAX {
+                    *hash_counts.entry(hash).or_insert(0) += 1;
+                }
+                scanned += 1;
+            }
+            None => break,
+        }
+    }
+
+    // Sort by frequency descending, take top patterns above threshold
+    let mut counts: Vec<(u64, u32)> = hash_counts.into_iter()
+        .filter(|&(_, c)| c >= min_count as u32)
+        .collect();
+    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    counts.truncate(max_patterns);
+
+    let patterns: Vec<u64> = counts.iter().map(|&(h, _)| h).collect();
+
+    info!("Pass 1: scanned {} reads, found {} patterns (min count ≥ {})",
+        scanned, patterns.len(), min_count);
+    for (i, &(hash, count)) in counts.iter().take(10).enumerate() {
+        info!("  pattern {}: hash={:#018x} count={}", i + 1, hash, count);
+    }
+
+    Ok(patterns)
+}
+
+// ── Pass 2: Route and compress ──────────────────────────────────────────
 
 pub(super) fn compress_factorize(args: &crate::cli::CompressArgs) -> Result<()> {
     use std::io::{Write, BufWriter};
@@ -36,17 +84,27 @@ pub(super) fn compress_factorize(args: &crate::cli::CompressArgs) -> Result<()> 
         quality_mode_to_binning(quality_mode)
     };
 
-    info!("Factorized compression: chunked read-to-read delta with split streams ({} records/chunk)", CHUNK_SIZE);
+    info!("Factorized compression v2: two-pass pattern routing");
 
+    // ── Pass 1: Learn patterns ──────────────────────────────────────────
     let mut reader = crate::io::FastqReader::from_path(&args.input[0], args.fasta)?;
+    let patterns = learn_patterns(&mut reader, SCAN_LIMIT, MIN_PATTERN_COUNT, MAX_PATTERNS)?;
+    let num_patterns = patterns.len();
+    drop(reader);
 
-    // Temp files for streaming compressed blocks
+    // Build routing set: any hash that matched a pattern → route to pattern stream
+    let routing_set: rustc_hash::FxHashSet<u64> = patterns.into_iter().collect();
+
+    // ── Pass 2: Route reads to streams ──────────────────────────────────
+    info!("Pass 2: routing reads to 1 pattern stream + main stream ({} learned patterns)", num_patterns);
+
     let working_dir = &args.working_dir;
-    let h_tmp_path = working_dir.join(".qz_factorize_h.tmp");
-    let m_tmp_path = working_dir.join(".qz_factorize_m.tmp");
-    let rs_tmp_path = working_dir.join(".qz_factorize_rs.tmp");
-    let ds_tmp_path = working_dir.join(".qz_factorize_ds.tmp");
-    let q_tmp_path = working_dir.join(".qz_factorize_q.tmp");
+
+    // Temp files: headers, main sequences, combined pattern sequences, qualities
+    let h_tmp_path = working_dir.join(".qz_fact2_h.tmp");
+    let ms_tmp_path = working_dir.join(".qz_fact2_ms.tmp");
+    let ps_tmp_path = working_dir.join(".qz_fact2_ps.tmp");
+    let q_tmp_path = working_dir.join(".qz_fact2_q.tmp");
 
     struct TmpCleanup(Vec<std::path::PathBuf>);
     impl Drop for TmpCleanup {
@@ -55,64 +113,63 @@ pub(super) fn compress_factorize(args: &crate::cli::CompressArgs) -> Result<()> 
         }
     }
     let _cleanup = TmpCleanup(vec![
-        h_tmp_path.clone(), m_tmp_path.clone(), rs_tmp_path.clone(),
-        ds_tmp_path.clone(), q_tmp_path.clone(),
+        h_tmp_path.clone(), ms_tmp_path.clone(), ps_tmp_path.clone(), q_tmp_path.clone(),
     ]);
 
     let mut h_tmp = BufWriter::new(std::fs::File::create(&h_tmp_path)?);
-    let mut m_tmp = BufWriter::new(std::fs::File::create(&m_tmp_path)?);
-    let mut rs_tmp = BufWriter::new(std::fs::File::create(&rs_tmp_path)?);
-    let mut ds_tmp = BufWriter::new(std::fs::File::create(&ds_tmp_path)?);
+    let mut ms_tmp = BufWriter::new(std::fs::File::create(&ms_tmp_path)?);
+    let mut ps_tmp = BufWriter::new(std::fs::File::create(&ps_tmp_path)?);
     let mut q_tmp = BufWriter::new(std::fs::File::create(&q_tmp_path)?);
 
     let mut h_num_blocks: u32 = 0;
-    let mut m_num_blocks: u32 = 0;
-    let mut rs_num_blocks: u32 = 0;
-    let mut ds_num_blocks: u32 = 0;
+    let mut ms_num_blocks: u32 = 0;
+    let mut ps_num_blocks: u32 = 0;
     let mut q_num_blocks: u32 = 0;
     let mut num_reads: usize = 0;
     let mut original_size: usize = 0;
-    let mut chunk_idx: usize = 0;
-    let mut total_delta: usize = 0;
-    let mut total_fwd: usize = 0;
-    let mut total_rc: usize = 0;
+    let mut routing: Vec<u8> = Vec::new();
+    let mut pattern_count: usize = 0;
+    let mut main_count: usize = 0;
 
-    // Read first chunk
+    let mut reader = crate::io::FastqReader::from_path(&args.input[0], args.fasta)?;
     let (mut cur_records, _, mut cur_orig) = read_chunk_records(&mut reader, CHUNK_SIZE)?;
+    let mut chunk_idx = 0usize;
 
     while !cur_records.is_empty() {
         let cur_reads = cur_records.len();
         info!("Chunk {}: {} reads", chunk_idx, cur_reads);
 
-        // Pipeline: compress current chunk while reading next
         let (next_result, compress_result) = std::thread::scope(|scope| {
             let records = std::mem::take(&mut cur_records);
+            let routing_set_ref = &routing_set;
 
-            let compress_handle = scope.spawn(move || -> Result<ChunkCompressed> {
-                compress_chunk(records, quality_mode, quality_binning, no_quality, bsc_static)
+            let compress_handle = scope.spawn(move || -> Result<ChunkResult> {
+                compress_chunk_v2(
+                    records, quality_mode, quality_binning, no_quality, bsc_static,
+                    routing_set_ref,
+                )
             });
 
-            // Read next chunk on main thread (overlapped with compression)
             let next = read_chunk_records(&mut reader, CHUNK_SIZE);
-
             let compressed = compress_handle.join().unwrap();
             (next, compressed)
         });
 
         let chunk = compress_result?;
+
         h_num_blocks += write_blocks_to_tmp(chunk.h_blocks, &mut h_tmp)?;
-        m_num_blocks += write_blocks_to_tmp(chunk.m_blocks, &mut m_tmp)?;
-        rs_num_blocks += write_blocks_to_tmp(chunk.rs_blocks, &mut rs_tmp)?;
-        if !chunk.ds_blocks.is_empty() {
-            ds_num_blocks += write_blocks_to_tmp(chunk.ds_blocks, &mut ds_tmp)?;
+        ms_num_blocks += write_blocks_to_tmp(chunk.ms_blocks, &mut ms_tmp)?;
+        if !chunk.ps_blocks.is_empty() {
+            ps_num_blocks += write_blocks_to_tmp(chunk.ps_blocks, &mut ps_tmp)?;
         }
         if !chunk.q_blocks.is_empty() {
             q_num_blocks += write_blocks_to_tmp(chunk.q_blocks, &mut q_tmp)?;
         }
 
-        total_delta += chunk.delta_count;
-        total_fwd += chunk.fwd_count;
-        total_rc += chunk.rc_count;
+        routing.extend_from_slice(&chunk.routing);
+        main_count += chunk.main_count;
+        pattern_count += chunk.pattern_count;
+
         num_reads += cur_reads;
         original_size += cur_orig;
         chunk_idx += 1;
@@ -122,338 +179,61 @@ pub(super) fn compress_factorize(args: &crate::cli::CompressArgs) -> Result<()> 
         cur_orig = no;
     }
 
-    // Flush temp files
-    h_tmp.flush()?; m_tmp.flush()?; rs_tmp.flush()?; ds_tmp.flush()?; q_tmp.flush()?;
-    drop(h_tmp); drop(m_tmp); drop(rs_tmp); drop(ds_tmp); drop(q_tmp);
+    h_tmp.flush()?; ms_tmp.flush()?; ps_tmp.flush()?; q_tmp.flush()?;
+    drop(h_tmp); drop(ms_tmp); drop(ps_tmp); drop(q_tmp);
 
     info!("Read {} records in {} chunks", num_reads, chunk_idx);
-    info!("  {}/{} reads delta-encoded ({:.1}%), {} fwd + {} rc",
-        total_delta, num_reads, 100.0 * total_delta as f64 / num_reads.max(1) as f64,
-        total_fwd, total_rc);
+    info!("  Main stream: {} reads ({:.1}%)", main_count, 100.0 * main_count as f64 / num_reads.max(1) as f64);
+    info!("  Pattern stream: {} reads ({:.1}%)", pattern_count, 100.0 * pattern_count as f64 / num_reads.max(1) as f64);
+
+    // Compress routing metadata
+    info!("Compressing routing metadata ({} bytes)...", routing.len());
+    let routing_compressed = bsc::compress_parallel(&routing)?;
+    drop(routing);
+    info!("  Routing compressed: {} bytes", routing_compressed.len());
 
     // Get temp file sizes
     let h_tmp_size = std::fs::metadata(&h_tmp_path)?.len() as usize;
-    let m_tmp_size = std::fs::metadata(&m_tmp_path)?.len() as usize;
-    let rs_tmp_size = std::fs::metadata(&rs_tmp_path)?.len() as usize;
-    let ds_tmp_size = std::fs::metadata(&ds_tmp_path)?.len() as usize;
+    let ms_tmp_size = std::fs::metadata(&ms_tmp_path)?.len() as usize;
+    let ps_tmp_size = std::fs::metadata(&ps_tmp_path)?.len() as usize;
     let q_tmp_size = std::fs::metadata(&q_tmp_path)?.len() as usize;
 
     let h_size = if h_num_blocks > 0 { 4 + h_tmp_size } else { 0 };
-    let m_size = if m_num_blocks > 0 { 4 + m_tmp_size } else { 0 };
-    let rs_size = if rs_num_blocks > 0 { 4 + rs_tmp_size } else { 0 };
-    let ds_size = if ds_num_blocks > 0 { 4 + ds_tmp_size } else { 0 };
+    let ms_size = if ms_num_blocks > 0 { 4 + ms_tmp_size } else { 0 };
+    let ps_size = if ps_num_blocks > 0 { 4 + ps_tmp_size } else { 0 };
     let q_size = if q_num_blocks > 0 { 4 + q_tmp_size } else { 0 };
 
-    // Write final archive
-    write_chunked_factorize_archive(
-        &args.output, quality_binning, no_quality,
-        num_reads, original_size, start_time,
-        h_size, m_size, rs_size, ds_size, q_size,
-        h_num_blocks, m_num_blocks, rs_num_blocks, ds_num_blocks, q_num_blocks,
-        &h_tmp_path, &m_tmp_path, &rs_tmp_path, &ds_tmp_path, &q_tmp_path,
-    )
-}
+    // Sequences region: version(1) + num_patterns(1)
+    //   + routing_len(8) + routing_data
+    //   + main_seq_len(8) + main_seq_blocks
+    //   + pattern_seq_len(8) + pattern_seq_blocks
+    let routing_compressed_len = routing_compressed.len();
+    let seq_region_size = 1 + 1
+        + 8 + routing_compressed_len
+        + 8 + ms_size
+        + 8 + ps_size;
 
-// ── Per-chunk compression ─────────────────────────────────────────────────
-
-struct ChunkCompressed {
-    h_blocks: Vec<Vec<u8>>,
-    m_blocks: Vec<Vec<u8>>,
-    rs_blocks: Vec<Vec<u8>>,
-    ds_blocks: Vec<Vec<u8>>,
-    q_blocks: Vec<Vec<u8>>,
-    delta_count: usize,
-    fwd_count: usize,
-    rc_count: usize,
-}
-
-fn compress_chunk(
-    records: Vec<crate::io::FastqRecord>,
-    quality_mode: crate::cli::QualityMode,
-    quality_binning: QualityBinning,
-    no_quality: bool,
-    bsc_static: bool,
-) -> Result<ChunkCompressed> {
-    let n = records.len();
-
-    // Pass 1: Build inverted index for this chunk
-    let index = build_read_index(&records);
-
-    // Pass 2: Encode reads (parallel)
-    use rayon::prelude::*;
-
-    let typical_len = records.iter().take(1000).map(|r| r.sequence.len()).max().unwrap_or(150);
-    let max_dist = (typical_len as f64 * 0.30) as usize;
-
-    struct ReadEncoded {
-        header: Vec<u8>,
-        meta: Vec<u8>,
-        raw_seq: Vec<u8>,
-        delta_seq: Vec<u8>,
-        quality: Vec<u8>,
-        is_delta: bool,
-        orientation: u8,
-    }
-
-    let encoded: Vec<ReadEncoded> = records.par_iter().enumerate().map(|(i, record)| {
-        let mut header = Vec::new();
-        let mut meta = Vec::new();
-        let mut raw_seq = Vec::new();
-        let mut delta_seq = Vec::new();
-        let mut quality = Vec::new();
-
-        dna_utils::write_varint(&mut header, record.id.len() as u64);
-        header.extend_from_slice(record.id.as_bytes());
-
-        if !no_quality {
-            if let Some(ref qual) = record.quality {
-                let quantized = quality::quantize_quality(qual, quality_mode);
-                dna_utils::write_varint(&mut quality, quantized.len() as u64);
-                let packed = columnar::pack_qualities(&quantized, quality_binning);
-                quality.extend_from_slice(&packed);
-            }
-        }
-
-        let read_seq = record.sequence.as_bytes();
-        let best_ref = find_best_reference(i, read_seq, &records, &index, max_dist);
-
-        match best_ref {
-            Some((ref_idx, orientation, _hamming)) => {
-                meta.push(orientation);
-                dna_utils::write_varint(&mut meta, ref_idx as u64);
-
-                let ref_seq = records[ref_idx].sequence.as_bytes();
-                dna_utils::write_varint(&mut delta_seq, read_seq.len() as u64);
-
-                if orientation == 1 {
-                    for (&rb, &refb) in read_seq.iter().zip(ref_seq.iter()) {
-                        delta_seq.push(if rb == refb { 0x00 } else { rb });
-                    }
-                    for &rb in &read_seq[ref_seq.len().min(read_seq.len())..] {
-                        delta_seq.push(rb);
-                    }
-                } else {
-                    let rn = ref_seq.len();
-                    for (j, &rb) in read_seq.iter().enumerate() {
-                        let rc_base = if j < rn { complement(ref_seq[rn - 1 - j]) } else { 0xFF };
-                        delta_seq.push(if rb == rc_base { 0x00 } else { rb });
-                    }
-                }
-
-                ReadEncoded { header, meta, raw_seq, delta_seq, quality,
-                    is_delta: true, orientation }
-            }
-            None => {
-                meta.push(0x00);
-                dna_utils::write_varint(&mut raw_seq, read_seq.len() as u64);
-                raw_seq.extend_from_slice(read_seq);
-                ReadEncoded { header, meta, raw_seq, delta_seq, quality,
-                    is_delta: false, orientation: 0 }
-            }
-        }
-    }).collect();
-
-    // Concatenate into streams
-    let mut header_stream = Vec::with_capacity(n * 64);
-    let mut meta_stream = Vec::with_capacity(n * 4);
-    let mut raw_seq_stream = Vec::with_capacity(n * 152);
-    let mut delta_seq_stream = Vec::new();
-    let mut qual_stream = Vec::with_capacity(if no_quality { 0 } else { n * 136 });
-    let mut delta_count = 0usize;
-    let mut fwd_count = 0usize;
-    let mut rc_count = 0usize;
-
-    for enc in &encoded {
-        header_stream.extend_from_slice(&enc.header);
-        meta_stream.extend_from_slice(&enc.meta);
-        raw_seq_stream.extend_from_slice(&enc.raw_seq);
-        delta_seq_stream.extend_from_slice(&enc.delta_seq);
-        qual_stream.extend_from_slice(&enc.quality);
-        if enc.is_delta {
-            delta_count += 1;
-            if enc.orientation == 1 { fwd_count += 1; } else { rc_count += 1; }
-        }
-    }
-    drop(encoded);
-
-    info!("  {}/{} delta ({:.1}%), {} fwd + {} rc, meta: {} B, raw_seq: {} B, delta_seq: {} B",
-        delta_count, n, 100.0 * delta_count as f64 / n as f64,
-        fwd_count, rc_count,
-        meta_stream.len(), raw_seq_stream.len(), delta_seq_stream.len());
-
-    // BSC-compress streams (sequentially to limit memory, like chunked mode)
-    let h_blocks = compress_stream_to_bsc_blocks(&header_stream, bsc_static)?;
-    drop(header_stream);
-    let m_blocks = compress_stream_to_bsc_blocks(&meta_stream, bsc_static)?;
-    drop(meta_stream);
-    let rs_blocks = compress_stream_to_bsc_blocks(&raw_seq_stream, bsc_static)?;
-    drop(raw_seq_stream);
-    let ds_blocks = if delta_seq_stream.is_empty() { Vec::new() }
-                    else { compress_stream_to_bsc_blocks(&delta_seq_stream, bsc_static)? };
-    drop(delta_seq_stream);
-    let q_blocks = if no_quality || qual_stream.is_empty() { Vec::new() }
-                   else { compress_stream_to_bsc_blocks(&qual_stream, bsc_static)? };
-    drop(qual_stream);
-
-    Ok(ChunkCompressed { h_blocks, m_blocks, rs_blocks, ds_blocks, q_blocks,
-        delta_count, fwd_count, rc_count })
-}
-
-// ── Inverted index ────────────────────────────────────────────────────────
-
-fn build_read_index(records: &[crate::io::FastqRecord]) -> rustc_hash::FxHashMap<u64, Vec<u32>> {
-    let mut index: rustc_hash::FxHashMap<u64, Vec<u32>> =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(4_000_000, Default::default());
-
-    for (i, record) in records.iter().enumerate() {
-        let seq = record.sequence.as_bytes();
-        if seq.len() < INDEX_K { continue; }
-        let mut pos = 0;
-        while pos + INDEX_K <= seq.len() {
-            if let Some(fwd) = dna_utils::kmer_to_hash(&seq[pos..pos + INDEX_K]) {
-                let rc = dna_utils::reverse_complement_hash(fwd, INDEX_K);
-                let canonical = fwd.min(rc);
-                let bucket = index.entry(canonical).or_default();
-                if bucket.len() < BUCKET_CAP {
-                    bucket.push(i as u32);
-                }
-            }
-            pos += INDEX_STRIDE;
-        }
-    }
-    index
-}
-
-fn find_best_reference(
-    read_idx: usize,
-    read: &[u8],
-    records: &[crate::io::FastqRecord],
-    index: &rustc_hash::FxHashMap<u64, Vec<u32>>,
-    max_dist: usize,
-) -> Option<(usize, u8, usize)> {
-    if read.len() < INDEX_K { return None; }
-
-    let mut candidate_counts: rustc_hash::FxHashMap<u32, u16> = rustc_hash::FxHashMap::default();
-
-    let mut pos = 0;
-    while pos + INDEX_K <= read.len() {
-        if let Some(fwd) = dna_utils::kmer_to_hash(&read[pos..pos + INDEX_K]) {
-            let rc = dna_utils::reverse_complement_hash(fwd, INDEX_K);
-            let canonical = fwd.min(rc);
-            if let Some(bucket) = index.get(&canonical) {
-                for &j in bucket {
-                    if (j as usize) < read_idx {
-                        *candidate_counts.entry(j).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        pos += INDEX_STRIDE;
-    }
-
-    if candidate_counts.is_empty() { return None; }
-
-    let mut candidates: Vec<(u32, u16)> = candidate_counts.into_iter().collect();
-    candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    candidates.truncate(8);
-
-    let mut best: Option<(usize, u8, usize)> = None;
-
-    for (j, _score) in candidates {
-        let ref_seq = records[j as usize].sequence.as_bytes();
-        if ref_seq.len() != read.len() { continue; }
-
-        let threshold = best.map(|b| b.2).unwrap_or(max_dist);
-        let dist_fwd = hamming_capped(read, ref_seq, threshold);
-        if dist_fwd <= threshold {
-            best = Some((j as usize, 1, dist_fwd));
-        }
-
-        let threshold = best.map(|b| b.2).unwrap_or(max_dist);
-        let dist_rc = hamming_rc_capped(read, ref_seq, threshold);
-        if dist_rc < threshold {
-            best = Some((j as usize, 2, dist_rc));
-        }
-    }
-
-    if let Some((_, _, dist)) = best {
-        let matching = read.len() - dist;
-        if matching < 10 { return None; }
-    }
-
-    best
-}
-
-#[inline]
-fn complement(b: u8) -> u8 {
-    match b {
-        b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C',
-        x => x,
-    }
-}
-
-fn hamming_capped(a: &[u8], b: &[u8], cap: usize) -> usize {
-    let mut dist = 0;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        if x != y { dist += 1; if dist > cap { return dist; } }
-    }
-    dist
-}
-
-fn hamming_rc_capped(a: &[u8], b: &[u8], cap: usize) -> usize {
-    let n = a.len().min(b.len());
-    let mut dist = 0;
-    for i in 0..n {
-        let rc_base = complement(b[n - 1 - i]);
-        if a[i] != rc_base { dist += 1; if dist > cap { return dist; } }
-    }
-    dist
-}
-
-// ── Chunked archive writer ───────────────────────────────────────────────
-
-/// Write chunked factorize archive (encoding_type=7).
-///
-/// sequences_region contains 3 sub-stream groups: meta, raw_seq, delta_seq.
-/// Each group has: [u64 total_size] [u32 num_blocks] [blocks...]
-fn write_chunked_factorize_archive(
-    output_path: &std::path::Path,
-    quality_binning: QualityBinning,
-    _no_quality: bool,
-    num_reads: usize,
-    original_size: usize,
-    start_time: Instant,
-    h_size: usize, m_size: usize, rs_size: usize, ds_size: usize, q_size: usize,
-    h_num_blocks: u32, m_num_blocks: u32, rs_num_blocks: u32, ds_num_blocks: u32, q_num_blocks: u32,
-    h_tmp: &std::path::Path, m_tmp: &std::path::Path,
-    rs_tmp: &std::path::Path, ds_tmp: &std::path::Path, q_tmp: &std::path::Path,
-) -> Result<()> {
-    use std::io::{Write, BufWriter};
-
-    // sequences_len = 3 sub-stream headers (u64 each) + sub-stream data
-    let factorized_seq_len = 3 * 8 + m_size + rs_size + ds_size;
-
+    // ── Write archive ───────────────────────────────────────────────────
     info!("Writing output file...");
-    let mut out = BufWriter::new(std::fs::File::create(output_path)?);
+    let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
 
     // Archive header (encoding_type=7)
-    out.write_all(&[7u8])?;
-    out.write_all(&[0u8])?;
-    out.write_all(&[binning_to_code(quality_binning)])?;
-    out.write_all(&[compressor_to_code(QualityCompressor::Bsc)])?;
-    out.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?;
-    out.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;
-    out.write_all(&[0u8; 3])?;
-    out.write_all(&0u16.to_le_bytes())?;
-    out.write_all(&[0u8])?;
+    out.write_all(&[7u8])?;                                           // encoding_type
+    out.write_all(&[0u8])?;                                           // arithmetic_mode
+    out.write_all(&[binning_to_code(quality_binning)])?;              // quality_binning
+    out.write_all(&[compressor_to_code(QualityCompressor::Bsc)])?;    // quality_compressor
+    out.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?; // seq_compressor
+    out.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?; // header_compressor
+    out.write_all(&[0u8; 3])?;                                       // padding
+    out.write_all(&0u16.to_le_bytes())?;                              // template_prefix
+    out.write_all(&[0u8])?;                                           // has_comment
 
     out.write_all(&(num_reads as u64).to_le_bytes())?;
     out.write_all(&(h_size as u64).to_le_bytes())?;
-    out.write_all(&(factorized_seq_len as u64).to_le_bytes())?;
-    out.write_all(&0u64.to_le_bytes())?;
+    out.write_all(&(seq_region_size as u64).to_le_bytes())?;
+    out.write_all(&0u64.to_le_bytes())?;                              // nmasks_len
     out.write_all(&(q_size as u64).to_le_bytes())?;
 
-    // Helper: copy num_blocks header + tmp file data to output
     let copy_stream = |num_blocks: u32, tmp_path: &std::path::Path, out: &mut BufWriter<std::fs::File>| -> Result<()> {
         if num_blocks == 0 { return Ok(()); }
         out.write_all(&num_blocks.to_le_bytes())?;
@@ -463,23 +243,29 @@ fn write_chunked_factorize_archive(
     };
 
     // Headers
-    copy_stream(h_num_blocks, h_tmp, &mut out)?;
+    copy_stream(h_num_blocks, &h_tmp_path, &mut out)?;
 
-    // Factorized sub-streams (each with u64 size prefix)
-    out.write_all(&(m_size as u64).to_le_bytes())?;
-    copy_stream(m_num_blocks, m_tmp, &mut out)?;
-    out.write_all(&(rs_size as u64).to_le_bytes())?;
-    copy_stream(rs_num_blocks, rs_tmp, &mut out)?;
-    out.write_all(&(ds_size as u64).to_le_bytes())?;
-    copy_stream(ds_num_blocks, ds_tmp, &mut out)?;
+    // Sequences region
+    out.write_all(&[FORMAT_VERSION])?;
+    out.write_all(&[num_patterns as u8])?;
+
+    out.write_all(&(routing_compressed_len as u64).to_le_bytes())?;
+    out.write_all(&routing_compressed)?;
+    drop(routing_compressed);
+
+    out.write_all(&(ms_size as u64).to_le_bytes())?;
+    copy_stream(ms_num_blocks, &ms_tmp_path, &mut out)?;
+
+    out.write_all(&(ps_size as u64).to_le_bytes())?;
+    copy_stream(ps_num_blocks, &ps_tmp_path, &mut out)?;
 
     // Qualities
-    copy_stream(q_num_blocks, q_tmp, &mut out)?;
+    copy_stream(q_num_blocks, &q_tmp_path, &mut out)?;
 
     out.flush()?;
 
     let metadata_size = 9 + 2 + 1 + 40;
-    let total = h_size + factorized_seq_len + q_size + metadata_size;
+    let total = h_size + seq_region_size + q_size + metadata_size;
 
     let elapsed = start_time.elapsed();
     info!("Compression completed in {:.2}s", elapsed.as_secs_f64());
@@ -488,20 +274,217 @@ fn write_chunked_factorize_archive(
     info!("Compression ratio: {:.2}x", original_size as f64 / total as f64);
     info!("Stream breakdown:");
     info!("  Headers:    {} bytes ({:.1}%)", h_size, 100.0 * h_size as f64 / total as f64);
-    info!("  Meta:       {} bytes ({:.1}%)", m_size, 100.0 * m_size as f64 / total as f64);
-    info!("  Raw seqs:   {} bytes ({:.1}%)", rs_size, 100.0 * rs_size as f64 / total as f64);
-    info!("  Delta seqs: {} bytes ({:.1}%)", ds_size, 100.0 * ds_size as f64 / total as f64);
+    info!("  Routing:    {} bytes ({:.1}%)", routing_compressed_len, 100.0 * routing_compressed_len as f64 / total as f64);
+    info!("  Main seqs:  {} bytes ({:.1}%)", ms_size, 100.0 * ms_size as f64 / total as f64);
+    info!("  Pattern seqs: {} bytes ({:.1}%)", ps_size, 100.0 * ps_size as f64 / total as f64);
     info!("  Qualities:  {} bytes ({:.1}%)", q_size, 100.0 * q_size as f64 / total as f64);
-    info!("  Metadata:   {} bytes ({:.1}%)", metadata_size, 100.0 * metadata_size as f64 / total as f64);
 
     Ok(())
 }
 
-// ── Decoder ───────────────────────────────────────────────────────────────
+// ── Per-chunk compression ───────────────────────────────────────────────
 
-/// Decode factorized sequences from 3 sub-streams (meta, raw_seq, delta_seq).
+struct ChunkResult {
+    h_blocks: Vec<Vec<u8>>,
+    ms_blocks: Vec<Vec<u8>>,
+    ps_blocks: Vec<Vec<u8>>,  // combined pattern stream blocks
+    q_blocks: Vec<Vec<u8>>,
+    routing: Vec<u8>,
+    main_count: usize,
+    pattern_count: usize,
+}
+
+fn compress_chunk_v2(
+    records: Vec<crate::io::FastqRecord>,
+    quality_mode: crate::cli::QualityMode,
+    quality_binning: QualityBinning,
+    no_quality: bool,
+    bsc_static: bool,
+    routing_set: &rustc_hash::FxHashSet<u64>,
+) -> Result<ChunkResult> {
+    let n = records.len();
+
+    let mut header_stream = Vec::with_capacity(n * 64);
+    let mut main_seq_stream = Vec::new();
+    let mut pattern_seq_stream = Vec::new();
+    let mut qual_stream = Vec::with_capacity(if no_quality { 0 } else { n * 136 });
+    let mut routing = Vec::with_capacity(n);
+    let mut main_count = 0usize;
+    let mut pattern_count = 0usize;
+
+    for record in &records {
+        // Header
+        dna_utils::write_varint(&mut header_stream, record.id.len() as u64);
+        header_stream.extend_from_slice(record.id.as_bytes());
+
+        // Quality
+        if !no_quality {
+            if let Some(ref qual) = record.quality {
+                let quantized = quality::quantize_quality(qual, quality_mode);
+                dna_utils::write_varint(&mut qual_stream, quantized.len() as u64);
+                let packed = columnar::pack_qualities(&quantized, quality_binning);
+                qual_stream.extend_from_slice(&packed);
+            }
+        }
+
+        // Route sequence: 0=main, 1=pattern
+        let seq = record.sequence.as_bytes();
+        let hash = dna_utils::compute_min_syncmer_hash(seq);
+        let is_pattern = routing_set.contains(&hash);
+        routing.push(if is_pattern { 1 } else { 0 });
+
+        let target = if is_pattern {
+            pattern_count += 1;
+            &mut pattern_seq_stream
+        } else {
+            main_count += 1;
+            &mut main_seq_stream
+        };
+        dna_utils::write_varint(target, seq.len() as u64);
+        target.extend_from_slice(seq);
+    }
+
+    // BSC-compress streams sequentially to limit memory
+    let h_blocks = compress_stream_to_bsc_blocks(&header_stream, bsc_static)?;
+    drop(header_stream);
+
+    let ms_blocks = compress_stream_to_bsc_blocks(&main_seq_stream, bsc_static)?;
+    drop(main_seq_stream);
+
+    let ps_blocks = if pattern_seq_stream.is_empty() {
+        Vec::new()
+    } else {
+        compress_stream_to_bsc_blocks(&pattern_seq_stream, bsc_static)?
+    };
+    drop(pattern_seq_stream);
+
+    let q_blocks = if no_quality || qual_stream.is_empty() {
+        Vec::new()
+    } else {
+        compress_stream_to_bsc_blocks(&qual_stream, bsc_static)?
+    };
+    drop(qual_stream);
+
+    Ok(ChunkResult {
+        h_blocks, ms_blocks, ps_blocks, q_blocks,
+        routing, main_count, pattern_count,
+    })
+}
+
+// ── Decoder ─────────────────────────────────────────────────────────────
+
+/// Decode pattern-routed sequences from the sequences region (version=2 format).
 ///
-/// Must process sequentially since delta reads reference earlier decoded reads.
+/// Format: [version:1B][num_patterns:1B][routing_len:8B][routing_data]
+///         [main_len:8B][main_blocks][pattern_len:8B][pattern_blocks]
+pub(super) fn decode_factorized_sequences_v2(
+    seq_region: &[u8],
+    num_reads: usize,
+) -> Result<Vec<String>> {
+    if seq_region.len() < 2 {
+        anyhow::bail!("Factorize v2: sequences region too small");
+    }
+
+    let version = seq_region[0];
+    if version != FORMAT_VERSION {
+        anyhow::bail!("Factorize v2: unexpected version byte {}", version);
+    }
+    let num_patterns = seq_region[1] as usize;
+    let mut off = 2usize;
+
+    info!("Factorize v2: {} learned patterns, 2 streams (main + pattern)", num_patterns);
+
+    // Read routing
+    if off + 8 > seq_region.len() {
+        anyhow::bail!("Factorize v2: truncated routing length");
+    }
+    let routing_len = u64::from_le_bytes(seq_region[off..off + 8].try_into().unwrap()) as usize;
+    off += 8;
+    if off + routing_len > seq_region.len() {
+        anyhow::bail!("Factorize v2: truncated routing data");
+    }
+    let routing_compressed = &seq_region[off..off + routing_len];
+    off += routing_len;
+
+    // Read main sequence stream
+    if off + 8 > seq_region.len() {
+        anyhow::bail!("Factorize v2: truncated main seq length");
+    }
+    let main_len = u64::from_le_bytes(seq_region[off..off + 8].try_into().unwrap()) as usize;
+    off += 8;
+    if off + main_len > seq_region.len() {
+        anyhow::bail!("Factorize v2: truncated main seq data");
+    }
+    let main_compressed = &seq_region[off..off + main_len];
+    off += main_len;
+
+    // Read combined pattern stream
+    if off + 8 > seq_region.len() {
+        anyhow::bail!("Factorize v2: truncated pattern seq length");
+    }
+    let pattern_len = u64::from_le_bytes(seq_region[off..off + 8].try_into().unwrap()) as usize;
+    off += 8;
+    if off + pattern_len > seq_region.len() {
+        anyhow::bail!("Factorize v2: truncated pattern seq data");
+    }
+    let pattern_compressed = &seq_region[off..off + pattern_len];
+
+    // Decompress routing
+    let routing_data = bsc::decompress_parallel(routing_compressed)
+        .context("Failed to decompress routing")?;
+
+    if routing_data.len() != num_reads {
+        anyhow::bail!("Factorize v2: routing length {} != num_reads {}",
+            routing_data.len(), num_reads);
+    }
+
+    // Decompress main + pattern streams in parallel
+    let (main_result, pattern_result) = rayon::join(
+        || if main_compressed.is_empty() { Ok(Vec::new()) }
+           else { bsc::decompress_parallel(main_compressed)
+               .context("Failed to decompress main sequence stream") },
+        || if pattern_compressed.is_empty() { Ok(Vec::new()) }
+           else { bsc::decompress_parallel(pattern_compressed)
+               .context("Failed to decompress pattern sequence stream") },
+    );
+    let main_data = main_result?;
+    let pattern_data = pattern_result?;
+
+    // Reconstruct sequences: walk routing, pull from main or pattern cursor
+    let pattern_reads: usize = routing_data.iter().filter(|&&r| r != 0).count();
+    info!("Reconstructing {} sequences ({} main + {} pattern)...",
+        num_reads, num_reads - pattern_reads, pattern_reads);
+
+    let mut main_off = 0usize;
+    let mut pattern_off = 0usize;
+    let mut sequences = Vec::with_capacity(num_reads);
+
+    for i in 0..num_reads {
+        let (data, cursor) = if routing_data[i] == 0 {
+            (&main_data, &mut main_off)
+        } else {
+            (&pattern_data, &mut pattern_off)
+        };
+
+        let seq_len = dna_utils::read_varint(data, cursor)
+            .ok_or_else(|| anyhow::anyhow!("Factorize v2: truncated seq_len for read {}", i))?
+            as usize;
+
+        if *cursor + seq_len > data.len() {
+            anyhow::bail!("Factorize v2: truncated sequence data for read {} (need {}, have {})",
+                i, seq_len, data.len() - *cursor);
+        }
+
+        let seq = String::from_utf8(data[*cursor..*cursor + seq_len].to_vec())
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in sequence {}: {}", i, e))?;
+        *cursor += seq_len;
+        sequences.push(seq);
+    }
+
+    Ok(sequences)
+}
+
+/// Legacy decoder for old 3-sub-stream format (factorize v1).
 pub(super) fn decode_factorized_sequences(
     meta_data: &[u8],
     raw_seq_data: &[u8],
@@ -522,8 +505,9 @@ pub(super) fn decode_factorized_sequences(
         meta_off += 1;
 
         if class == 0 {
-            let seq_len = read_varint(raw_seq_data, &mut raw_off)
-                .ok_or_else(|| anyhow::anyhow!("Failed to read raw seq_len for read {}", i))?;
+            let seq_len = dna_utils::read_varint(raw_seq_data, &mut raw_off)
+                .ok_or_else(|| anyhow::anyhow!("Failed to read raw seq_len for read {}", i))?
+                as usize;
             if raw_off + seq_len > raw_seq_data.len() {
                 anyhow::bail!("Truncated raw seq data for read {}", i);
             }
@@ -531,15 +515,17 @@ pub(super) fn decode_factorized_sequences(
             raw_off += seq_len;
             sequences.push(seq);
         } else {
-            let ref_idx = read_varint(meta_data, &mut meta_off)
-                .ok_or_else(|| anyhow::anyhow!("Failed to read ref_index for read {}", i))?;
+            let ref_idx = dna_utils::read_varint(meta_data, &mut meta_off)
+                .ok_or_else(|| anyhow::anyhow!("Failed to read ref_index for read {}", i))?
+                as usize;
             if ref_idx >= sequences.len() {
                 anyhow::bail!("Invalid ref_index {} for read {} (only {} decoded)",
                     ref_idx, i, sequences.len());
             }
 
-            let seq_len = read_varint(delta_seq_data, &mut delta_off)
-                .ok_or_else(|| anyhow::anyhow!("Failed to read delta seq_len for read {}", i))?;
+            let seq_len = dna_utils::read_varint(delta_seq_data, &mut delta_off)
+                .ok_or_else(|| anyhow::anyhow!("Failed to read delta seq_len for read {}", i))?
+                as usize;
             if delta_off + seq_len > delta_seq_data.len() {
                 anyhow::bail!("Truncated delta seq data for read {}", i);
             }
@@ -581,4 +567,12 @@ pub(super) fn decode_factorized_sequences(
         String::from_utf8(bytes)
             .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in sequence {}: {}", i, e))
     }).collect()
+}
+
+#[inline]
+fn complement(b: u8) -> u8 {
+    match b {
+        b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C',
+        x => x,
+    }
 }

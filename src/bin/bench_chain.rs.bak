@@ -1,0 +1,423 @@
+/// Prototype: Can chaining compressors beat BSC alone?
+///
+/// Tests:
+///   1. BSC output → zstd/xz (residual compressibility of BSC output)
+///   2. Different BSC block sizes (25MB → single block)
+///   3. Alternative compressors on raw/sorted data (xz, zstd-22, bzip2)
+///   4. Two-stage: BWT-friendly transform → different entropy coder
+///   5. Split streams: separate high/low bits, compress independently
+///
+/// Usage: cargo run --release --bin bench_chain [fastq_path]
+
+use std::io::{BufRead, Write};
+use std::process::{Command, Stdio};
+use std::time::Instant;
+
+use qz::compression::bsc;
+use rayon::prelude::*;
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+#[inline]
+fn base_to_2bit(b: u8) -> u8 {
+    match b {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 0,
+    }
+}
+
+fn minimizer_sort_key(seq: &[u8]) -> u64 {
+    let k = 21;
+    if seq.len() < k {
+        return u64::MAX;
+    }
+    let mut min_hash = u64::MAX;
+    for i in 0..=seq.len() - k {
+        let mut fwd: u64 = 0;
+        let mut rev: u64 = 0;
+        let mut valid = true;
+        for j in 0..k {
+            let v = match seq[i + j] {
+                b'A' | b'a' => 0u64,
+                b'C' | b'c' => 1,
+                b'G' | b'g' => 2,
+                b'T' | b't' => 3,
+                _ => { valid = false; break; }
+            };
+            fwd = (fwd << 2) | v;
+            rev = rev | ((3 - v) << (2 * j));
+        }
+        if valid {
+            min_hash = min_hash.min(fwd.min(rev));
+        }
+    }
+    min_hash
+}
+
+/// Compress data with an external CLI tool, return compressed size.
+/// Uses temp files to avoid pipe deadlock on large data.
+fn compress_external(data: &[u8], cmd: &str, args: &[&str]) -> Option<usize> {
+    use std::io::Read;
+
+    let input_path = "/tmp/qz_bench_chain_input.tmp";
+    let output_path = "/tmp/qz_bench_chain_output.tmp";
+
+    std::fs::write(input_path, data).ok()?;
+
+    // Build args: replace "-c" with "-o output_path" + input_path
+    // Most compressors support: cmd [flags] -o outfile infile
+    // But simpler: use shell redirect
+    let args_str: Vec<&str> = args.iter().copied().filter(|a| *a != "-c").collect();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} {} < {} > {}", cmd,
+            args_str.join(" "), input_path, output_path))
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+
+    let _ = std::fs::remove_file(input_path);
+
+    if !status.success() {
+        let _ = std::fs::remove_file(output_path);
+        return None;
+    }
+
+    let mut compressed = Vec::new();
+    std::fs::File::open(output_path).ok()?.read_to_end(&mut compressed).ok()?;
+    let _ = std::fs::remove_file(output_path);
+
+    Some(compressed.len())
+}
+
+fn report(name: &str, size: usize, raw_size: usize) {
+    eprintln!(
+        "  {:<50} {:>10} B  {:.3}x  {:.4} bpb",
+        name,
+        size,
+        raw_size as f64 / size as f64,
+        8.0 * size as f64 / raw_size as f64,
+    );
+}
+
+fn report_timed(name: &str, size: usize, raw_size: usize, elapsed: f64) {
+    eprintln!(
+        "  {:<50} {:>10} B  {:.3}x  {:.4} bpb  {:.2}s",
+        name,
+        size,
+        raw_size as f64 / size as f64,
+        8.0 * size as f64 / raw_size as f64,
+        elapsed,
+    );
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    let fastq_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "real_data/ERR3239334_1.1m.fastq".to_string());
+
+    eprintln!("=== Compressor Chaining Benchmark ===");
+    eprintln!("Reading FASTQ: {}", fastq_path);
+
+    let t0 = Instant::now();
+    let file = std::fs::File::open(&fastq_path).expect("Cannot open FASTQ file");
+    let reader = std::io::BufReader::new(file);
+
+    let mut sequences: Vec<Vec<u8>> = Vec::new();
+    let mut line_num = 0u64;
+
+    for line in reader.lines() {
+        let line = line.expect("Failed to read line");
+        if line_num % 4 == 1 {
+            sequences.push(line.trim_end().as_bytes().to_vec());
+        }
+        line_num += 1;
+    }
+    eprintln!(
+        "Read {} sequences in {:.2}s\n",
+        sequences.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    let num_reads = sequences.len();
+    let read_len = sequences[0].len();
+    let raw_size = num_reads * read_len;
+
+    // Sort reads
+    let mut sort_keys: Vec<(u64, usize)> = sequences
+        .par_iter()
+        .enumerate()
+        .map(|(i, seq)| (minimizer_sort_key(seq), i))
+        .collect();
+    sort_keys.sort_unstable();
+    let sorted_idx: Vec<usize> = sort_keys.iter().map(|&(_, i)| i).collect();
+    let sorted_seqs: Vec<&[u8]> = sorted_idx.iter().map(|&i| sequences[i].as_slice()).collect();
+
+    // Build concatenated data
+    let raw_concat: Vec<u8> = sequences.iter().flat_map(|s| s.iter().copied()).collect();
+    let sorted_concat: Vec<u8> = sorted_seqs.iter().flat_map(|s| s.iter().copied()).collect();
+
+    // Permutation cost
+    let perm_bytes: Vec<u8> = sorted_idx
+        .iter()
+        .flat_map(|&i| (i as u32).to_le_bytes())
+        .collect();
+    let perm_cost = bsc::compress_parallel_adaptive(&perm_bytes).unwrap().len();
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SECTION 1: Baselines — each compressor on raw and sorted data
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("--- Section 1: Single compressor baselines ---");
+
+    // BSC baselines
+    let t = Instant::now();
+    let bsc_raw_size = {
+        let c = bsc::compress_parallel_adaptive(&raw_concat).unwrap();
+        let s = c.len();
+        report_timed("BSC adaptive (raw)", s, raw_size, t.elapsed().as_secs_f64());
+        s
+    };
+
+    let t = Instant::now();
+    let bsc_sorted_size = {
+        let c = bsc::compress_parallel_adaptive(&sorted_concat).unwrap();
+        let s = c.len();
+        report_timed("BSC adaptive (sorted)", s, raw_size, t.elapsed().as_secs_f64());
+        s
+    };
+
+    // External baselines already measured in prior run:
+    // zstd-3 sorted: 41,289,513 B (3.633x)
+    // zstd-19 sorted: 33,651,470 B (4.457x)
+    // bzip2-9 sorted: 36,755,182 B (4.081x)
+    // xz-6 sorted: 33,061,948 B (4.537x)
+    eprintln!("  (external baselines: zstd-19=33.7M, xz-6=33.1M, bzip2=36.8M — all worse than BSC)");
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SECTION 2: BSC block size sweep (sorted data)
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("\n--- Section 2: BSC block size sweep (sorted data) ---");
+
+    for block_mb in [10, 25, 50, 100, 150] {
+        let block_size = block_mb * 1024 * 1024;
+        let t = Instant::now();
+
+        let blocks: Vec<&[u8]> = sorted_concat.chunks(block_size).collect();
+        let compressed_blocks: Vec<Vec<u8>> = blocks
+            .par_iter()
+            .map(|block| bsc::compress_adaptive(block).unwrap())
+            .collect();
+        let total_size: usize = compressed_blocks.iter().map(|b| b.len()).sum::<usize>()
+            + 4 // num_blocks header
+            + compressed_blocks.len() * 4; // per-block length headers
+
+        report_timed(
+            &format!("BSC {}MB blocks (sorted)", block_mb),
+            total_size,
+            raw_size,
+            t.elapsed().as_secs_f64(),
+        );
+    }
+
+    // Single-block BSC (entire dataset as one BWT)
+    {
+        let t = Instant::now();
+        let single = bsc::compress_adaptive_mt(&sorted_concat).unwrap();
+        report_timed("BSC single-block (sorted, MT)", single.len(), raw_size, t.elapsed().as_secs_f64());
+    }
+
+    // SECTION 3 already measured: BSC output → zstd/xz/bzip2 = 0% gain.
+    // BSC output is effectively random — no residual structure.
+    eprintln!("\n  (BSC output → 2nd compressor: 0.00% gain — BSC output is near-random)");
+    drop(bsc_sorted);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SECTION 4: BSC with different coder/sorter parameters
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("\n--- Section 4: BSC parameter sweep (sorted, 25MB blocks) ---");
+
+    // BSC parameters: (lzp_hash_size, lzp_min_len, block_sorter, coder)
+    // block_sorter: 1=BWT, 7=ST7
+    // coder: 1=QLFC_STATIC, 2=QLFC_ADAPTIVE
+    let params = [
+        ("BWT + QLFC static", 16, 128, 1, 1),
+        ("BWT + QLFC adaptive", 16, 128, 1, 2),
+        ("BWT + QLFC adaptive (no LZP)", 0, 0, 1, 2),
+        ("BWT + QLFC adaptive (LZP hash=20)", 20, 64, 1, 2),
+    ];
+
+    for (name, lzp_hash, lzp_min, sorter, coder) in params {
+        let t = Instant::now();
+
+        let blocks: Vec<&[u8]> = sorted_concat.chunks(25 * 1024 * 1024).collect();
+        let compressed_blocks: Vec<Vec<u8>> = blocks
+            .par_iter()
+            .map(|block| {
+                bsc::compress_with_params(block, lzp_hash, lzp_min, sorter, coder).unwrap()
+            })
+            .collect();
+        let total_size: usize = compressed_blocks.iter().map(|b| b.len()).sum::<usize>()
+            + 4 + compressed_blocks.len() * 4;
+
+        report_timed(name, total_size, raw_size, t.elapsed().as_secs_f64());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SECTION 5: Bit-plane splitting → per-plane compression
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("\n--- Section 5: Bit-plane splitting (sorted data) ---");
+
+    {
+        let t = Instant::now();
+
+        // Encode as 2-bit, then split into high and low bit planes
+        let sorted_2bit: Vec<u8> = sorted_concat.iter().map(|&b| base_to_2bit(b)).collect();
+
+        let high_bits: Vec<u8> = sorted_2bit.iter().map(|&v| (v >> 1) & 1).collect();
+        let low_bits: Vec<u8> = sorted_2bit.iter().map(|&v| v & 1).collect();
+
+        let high_compressed = bsc::compress_parallel_adaptive(&high_bits).unwrap();
+        let low_compressed = bsc::compress_parallel_adaptive(&low_bits).unwrap();
+
+        eprintln!(
+            "  High bit plane: {} B ({:.4} bpb)",
+            high_compressed.len(),
+            8.0 * high_compressed.len() as f64 / raw_size as f64,
+        );
+        eprintln!(
+            "  Low bit plane:  {} B ({:.4} bpb)",
+            low_compressed.len(),
+            8.0 * low_compressed.len() as f64 / raw_size as f64,
+        );
+
+        let total = high_compressed.len() + low_compressed.len();
+        report_timed("Bit-plane split BSC", total, raw_size, t.elapsed().as_secs_f64());
+
+        // Also try: pack 8 bits per byte (8 bases' high bits in one byte)
+        let high_packed: Vec<u8> = high_bits
+            .chunks(8)
+            .map(|chunk| {
+                let mut byte = 0u8;
+                for (j, &bit) in chunk.iter().enumerate() {
+                    byte |= bit << (7 - j);
+                }
+                byte
+            })
+            .collect();
+        let low_packed: Vec<u8> = low_bits
+            .chunks(8)
+            .map(|chunk| {
+                let mut byte = 0u8;
+                for (j, &bit) in chunk.iter().enumerate() {
+                    byte |= bit << (7 - j);
+                }
+                byte
+            })
+            .collect();
+
+        let hp_compressed = bsc::compress_parallel_adaptive(&high_packed).unwrap();
+        let lp_compressed = bsc::compress_parallel_adaptive(&low_packed).unwrap();
+        let packed_total = hp_compressed.len() + lp_compressed.len();
+
+        eprintln!(
+            "  High packed: {} B, Low packed: {} B",
+            hp_compressed.len(), lp_compressed.len()
+        );
+        report_timed("Bit-plane packed BSC", packed_total, raw_size, t.elapsed().as_secs_f64());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SECTION 6: Nibble split (bases 0,2,4,... vs 1,3,5,...)
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("\n--- Section 6: Even/odd position split (sorted data) ---");
+
+    {
+        let t = Instant::now();
+
+        let mut even_stream = Vec::with_capacity(raw_size / 2 + 1);
+        let mut odd_stream = Vec::with_capacity(raw_size / 2 + 1);
+
+        for seq in &sorted_seqs {
+            for (i, &b) in seq.iter().enumerate() {
+                if i % 2 == 0 {
+                    even_stream.push(b);
+                } else {
+                    odd_stream.push(b);
+                }
+            }
+        }
+
+        let even_c = bsc::compress_parallel_adaptive(&even_stream).unwrap();
+        let odd_c = bsc::compress_parallel_adaptive(&odd_stream).unwrap();
+        let total = even_c.len() + odd_c.len();
+
+        eprintln!("  Even positions: {} B, Odd positions: {} B", even_c.len(), odd_c.len());
+        report_timed("Even/odd split BSC", total, raw_size, t.elapsed().as_secs_f64());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SECTION 7: Hybrid — best external on sorted + BSC on sorted
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("\n--- Section 7: Block-level hybrid (per-block best of BSC vs zstd-22) ---");
+
+    {
+        let t = Instant::now();
+        let block_size = 25 * 1024 * 1024;
+        let blocks: Vec<&[u8]> = sorted_concat.chunks(block_size).collect();
+
+        let mut total_best = 0usize;
+        let mut bsc_wins = 0;
+        let mut zstd_wins = 0;
+
+        for (i, block) in blocks.iter().enumerate() {
+            let bsc_size = bsc::compress_adaptive(block).unwrap().len();
+            let zstd_size = compress_external(block, "zstd", &["--ultra", "-22", "-c"]).unwrap_or(usize::MAX);
+
+            let best = bsc_size.min(zstd_size);
+            total_best += best;
+
+            if best == bsc_size { bsc_wins += 1; }
+            else { zstd_wins += 1; }
+
+            if i < 3 || i == blocks.len() - 1 {
+                eprintln!(
+                    "  Block {}: BSC={} zstd-22={} → best={}",
+                    i, bsc_size,
+                    if zstd_size == usize::MAX { "fail".to_string() } else { zstd_size.to_string() },
+                    best,
+                );
+            }
+        }
+
+        let overhead = blocks.len();
+        let total_with_overhead = total_best + overhead + 4;
+
+        eprintln!("  Winners: BSC={}, zstd={}", bsc_wins, zstd_wins);
+        report_timed("Per-block best compressor", total_with_overhead, raw_size, t.elapsed().as_secs_f64());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Summary
+    // ═══════════════════════════════════════════════════════════════════
+
+    eprintln!("\n=== Key reference points ===");
+    report("BSC raw (baseline)", bsc_raw.len(), raw_size);
+    report("BSC sorted", bsc_sorted.len(), raw_size);
+    eprintln!("  Permutation overhead: {} B", perm_cost);
+    eprintln!("  Net sorted: {} B ({:.3}x)", bsc_sorted.len() + perm_cost,
+        raw_size as f64 / (bsc_sorted.len() + perm_cost) as f64);
+
+    drop(bsc_raw);
+    drop(bsc_sorted);
+}

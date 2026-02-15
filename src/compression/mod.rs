@@ -19,6 +19,8 @@ pub mod quality_context;
 pub mod openzl;
 pub mod template;
 mod factorize;
+mod harc;
+mod quality_ctx;
 
 use crate::cli::{CompressArgs, DecompressArgs, QualityMode, QualityCompressor, SequenceCompressor, HeaderCompressor};
 use anyhow::{Context, Result};
@@ -27,6 +29,9 @@ use tracing::info;
 
 /// Number of BSC blocks to decompress in each parallel batch
 const DECOMPRESS_BATCH_SIZE: usize = 8;
+
+/// Minimum reads for quality_ctx to outperform BSC (below this, models don't converge)
+const MIN_READS_QUALITY_CTX: usize = 100_000;
 /// I/O buffer size for reading archive files during decompression
 const IO_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 
@@ -70,6 +75,7 @@ fn compressor_to_code(compressor: QualityCompressor) -> u8 {
         QualityCompressor::Bsc => 1,
         QualityCompressor::OpenZl => 2,
         QualityCompressor::Fqzcomp => 3,
+        QualityCompressor::QualityCtx => 4,
     }
 }
 
@@ -80,6 +86,7 @@ fn code_to_compressor(code: u8) -> Result<QualityCompressor> {
         1 => Ok(QualityCompressor::Bsc),
         2 => Ok(QualityCompressor::OpenZl),
         3 => Ok(QualityCompressor::Fqzcomp),
+        4 => Ok(QualityCompressor::QualityCtx),
         _ => anyhow::bail!("Invalid quality compressor code: {}", code),
     }
 }
@@ -226,6 +233,13 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
     let mut total_bases: usize = 0;
     let mut original_size: usize = 0;
 
+    // Collect raw strings for quality_ctx (if applicable)
+    let collect_for_ctx = !args.no_quality && args.quality_mode == QualityMode::Lossless;
+    let mut qual_strings: Vec<String> = if collect_for_ctx { Vec::with_capacity(est_reads) } else { Vec::new() };
+    let mut seq_strings: Vec<String> = if collect_for_ctx { Vec::with_capacity(est_reads) } else { Vec::new() };
+    let mut fixed_read_len: Option<usize> = None;
+    let mut variable_lengths = false;
+
     // Delta encoding state (only used when --sequence-delta)
     let mut delta_cache: std::collections::HashMap<u64, usize> = if args.sequence_delta {
         std::collections::HashMap::with_capacity(est_reads)
@@ -267,9 +281,23 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
             }
         }
 
-        total_bases += record.sequence.len();
-        original_size += record.id.len() + record.sequence.len()
-            + record.quality.as_ref().map(|q| q.len()).unwrap_or(0) + 3;
+        // Track sizes before potential move
+        let seq_len = record.sequence.len();
+        let qual_len = record.quality.as_ref().map(|q| q.len()).unwrap_or(0);
+        total_bases += seq_len;
+        original_size += record.id.len() + seq_len + qual_len + 3;
+
+        // Track read length consistency and collect strings for quality_ctx
+        if collect_for_ctx {
+            match fixed_read_len {
+                None => fixed_read_len = Some(seq_len),
+                Some(prev) if prev != seq_len => variable_lengths = true,
+                _ => {}
+            }
+            seq_strings.push(record.sequence);
+            qual_strings.push(record.quality.unwrap_or_default());
+        }
+
         num_reads += 1;
 
         if num_reads % 10_000_000 == 0 {
@@ -287,29 +315,73 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
     info!("Stream sizes: headers={} seq={} qual={}",
         header_stream.len(), seq_stream.len(), qual_stream.len());
 
-    // Compress all three streams in parallel with BSC
-    info!("Compressing streams with BSC{}...",
-        if bsc_static { " (static)" } else { " (adaptive)" });
+    // Decide quality compression method
+    // Auto-select quality_ctx for large fixed-length lossless datasets,
+    // or respect an explicit QualityCompressor::QualityCtx setting
+    let use_quality_ctx = collect_for_ctx
+        && !variable_lengths
+        && !args.no_quality
+        && (args.quality_compressor == QualityCompressor::QualityCtx
+            || num_reads >= MIN_READS_QUALITY_CTX);
 
-    let (header_result, (seq_result, qual_result)) = rayon::join(
-        || bsc_compress_parallel(&header_stream, bsc_static),
-        || rayon::join(
+    if args.quality_compressor == QualityCompressor::QualityCtx && !use_quality_ctx && variable_lengths {
+        info!("Warning: quality-ctx requires fixed-length reads, falling back to BSC");
+    }
+
+    let quality_compressor_used = if use_quality_ctx {
+        QualityCompressor::QualityCtx
+    } else {
+        QualityCompressor::Bsc
+    };
+
+    // Compress streams
+    let (headers, sequences, qualities) = if use_quality_ctx {
+        info!("Compressing qualities with context-adaptive range coder ({} reads)...", num_reads);
+        drop(qual_stream); // Don't need packed stream for quality_ctx
+
+        let qual_refs: Vec<&str> = qual_strings.iter().map(|s| s.as_str()).collect();
+        let seq_refs: Vec<&str> = seq_strings.iter().map(|s| s.as_str()).collect();
+
+        // Compress headers + sequences in parallel, then quality_ctx (needs sequence context)
+        let (header_result, seq_result) = rayon::join(
+            || bsc_compress_parallel(&header_stream, bsc_static),
             || bsc_compress_parallel(&seq_stream, bsc_static),
-            || if args.no_quality {
-                Ok(Vec::new())
-            } else {
-                bsc_compress_parallel(&qual_stream, bsc_static)
-            },
-        ),
-    );
+        );
+        drop(header_stream);
+        drop(seq_stream);
 
-    drop(header_stream);
-    drop(seq_stream);
-    drop(qual_stream);
+        let ctx_blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
+        drop(qual_strings);
+        drop(seq_strings);
+        let qualities = quality_ctx::wrap_as_multiblock(ctx_blob);
 
-    let headers = header_result?;
-    let sequences = seq_result?;
-    let qualities = qual_result?;
+        info!("Quality ctx: {} bytes", qualities.len());
+        (header_result?, seq_result?, qualities)
+    } else {
+        drop(qual_strings);
+        drop(seq_strings);
+
+        info!("Compressing streams with BSC{}...",
+            if bsc_static { " (static)" } else { " (adaptive)" });
+
+        let (header_result, (seq_result, qual_result)) = rayon::join(
+            || bsc_compress_parallel(&header_stream, bsc_static),
+            || rayon::join(
+                || bsc_compress_parallel(&seq_stream, bsc_static),
+                || if args.no_quality {
+                    Ok(Vec::new())
+                } else {
+                    bsc_compress_parallel(&qual_stream, bsc_static)
+                },
+            ),
+        );
+
+        drop(header_stream);
+        drop(seq_stream);
+        drop(qual_stream);
+
+        (header_result?, seq_result?, qual_result?)
+    };
 
     // Write output file (same archive format as non-streaming path)
     info!("Writing output file...");
@@ -319,7 +391,7 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
     output_file.write_all(&[encoding_type])?;                                   // encoding_type
     output_file.write_all(&[0u8])?;                                             // arithmetic = disabled
     output_file.write_all(&[binning_to_code(quality_binning)])?;                // quality_binning
-    output_file.write_all(&[compressor_to_code(QualityCompressor::Bsc)])?;      // quality_compressor
+    output_file.write_all(&[compressor_to_code(quality_compressor_used)])?;     // quality_compressor
     output_file.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?; // seq_compressor
     output_file.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;// header_compressor
     output_file.write_all(&[0u8])?;                                             // quality_model = disabled
@@ -357,9 +429,26 @@ fn compress_streaming_bsc(args: &CompressArgs) -> Result<()> {
     Ok(())
 }
 
+/// Result of reading a chunk of FASTQ records into compression streams.
+struct ChunkStreams {
+    header_stream: Vec<u8>,
+    seq_stream: Vec<u8>,
+    qual_stream: Vec<u8>,
+    rc_flags: Vec<u8>,
+    num_reads: usize,
+    total_bases: usize,
+    original_size: usize,
+    /// Raw quality strings (only populated when collect_strings=true)
+    qual_strings: Vec<String>,
+    /// Raw sequence strings (only populated when collect_strings=true)
+    seq_strings: Vec<String>,
+    /// Whether reads have variable lengths (quality_ctx requires fixed length)
+    variable_lengths: bool,
+}
+
 /// Read a chunk of FASTQ records into raw compression streams.
-/// Returns (header_stream, seq_stream, qual_stream, rc_flags, num_reads, total_bases, original_size).
 /// rc_flags is empty unless rc_canon=true, in which case it has 1 byte per read (0=fwd, 1=revcomp).
+/// When collect_strings=true, also keeps raw quality and sequence strings for quality_ctx.
 fn read_chunk_streams<R: std::io::BufRead>(
     reader: &mut crate::io::FastqReader<R>,
     chunk_size: usize,
@@ -369,14 +458,19 @@ fn read_chunk_streams<R: std::io::BufRead>(
     sequence_hints: bool,
     sequence_delta: bool,
     rc_canon: bool,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, usize, usize, usize)> {
+    collect_strings: bool,
+) -> Result<ChunkStreams> {
     let mut header_stream = Vec::with_capacity(chunk_size * 64);
     let mut seq_stream = Vec::with_capacity(chunk_size * 152);
     let mut qual_stream = Vec::with_capacity(chunk_size * 136);
     let mut rc_flags: Vec<u8> = if rc_canon { Vec::with_capacity(chunk_size) } else { Vec::new() };
+    let mut qual_strings: Vec<String> = if collect_strings { Vec::with_capacity(chunk_size) } else { Vec::new() };
+    let mut seq_strings: Vec<String> = if collect_strings { Vec::with_capacity(chunk_size) } else { Vec::new() };
     let mut chunk_reads = 0usize;
     let mut chunk_bases = 0usize;
     let mut chunk_orig = 0usize;
+    let mut fixed_read_len: Option<usize> = None;
+    let mut variable_lengths = false;
 
     let mut delta_cache = std::collections::HashMap::new();
     let mut delta_reads = Vec::new();
@@ -412,16 +506,39 @@ fn read_chunk_streams<R: std::io::BufRead>(
                     }
                 }
 
-                chunk_bases += record.sequence.len();
-                chunk_orig += record.id.len() + record.sequence.len()
-                    + record.quality.as_ref().map(|q| q.len()).unwrap_or(0) + 3;
+                let seq_len = record.sequence.len();
+                let qual_len = record.quality.as_ref().map(|q| q.len()).unwrap_or(0);
+                chunk_bases += seq_len;
+                chunk_orig += record.id.len() + seq_len + qual_len + 3;
+
+                if collect_strings {
+                    match fixed_read_len {
+                        None => fixed_read_len = Some(seq_len),
+                        Some(prev) if prev != seq_len => variable_lengths = true,
+                        _ => {}
+                    }
+                    seq_strings.push(record.sequence);
+                    qual_strings.push(record.quality.unwrap_or_default());
+                }
+
                 chunk_reads += 1;
             }
             None => break,
         }
     }
 
-    Ok((header_stream, seq_stream, qual_stream, rc_flags, chunk_reads, chunk_bases, chunk_orig))
+    Ok(ChunkStreams {
+        header_stream,
+        seq_stream,
+        qual_stream,
+        rc_flags,
+        num_reads: chunk_reads,
+        total_bases: chunk_bases,
+        original_size: chunk_orig,
+        qual_strings,
+        seq_strings,
+        variable_lengths,
+    })
 }
 
 /// Read a chunk of FASTQ records into a Vec (for reorder modes that need to sort before streaming).
@@ -656,13 +773,34 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
     let mut chunk_idx: usize = 0;
     let rc_canon = args.rc_canon;
 
-    // Read first chunk
-    let (mut cur_h, mut cur_s, mut cur_q, mut cur_rc, mut cur_reads, mut cur_bases, mut cur_orig) =
-        read_chunk_streams(&mut reader, CHUNK_SIZE, quality_mode, quality_binning, no_quality, args.sequence_hints, args.sequence_delta, rc_canon)?;
+    // Decide if quality_ctx is possible (lossless mode, not no_quality)
+    let collect_for_ctx = !no_quality && quality_mode == QualityMode::Lossless;
 
-    while cur_reads > 0 {
+    // Read first chunk
+    let mut cur = read_chunk_streams(
+        &mut reader, CHUNK_SIZE, quality_mode, quality_binning, no_quality,
+        args.sequence_hints, args.sequence_delta, rc_canon, collect_for_ctx,
+    )?;
+
+    // Decide quality_ctx usage from first chunk (must be consistent across all chunks)
+    let use_quality_ctx = collect_for_ctx
+        && !cur.variable_lengths
+        && (args.quality_compressor == QualityCompressor::QualityCtx
+            || cur.num_reads >= MIN_READS_QUALITY_CTX);
+    let quality_compressor_used = if use_quality_ctx {
+        QualityCompressor::QualityCtx
+    } else {
+        QualityCompressor::Bsc
+    };
+    if use_quality_ctx {
+        info!("Using context-adaptive quality compression (quality_ctx)");
+    } else if args.quality_compressor == QualityCompressor::QualityCtx && cur.variable_lengths {
+        info!("Warning: quality-ctx requires fixed-length reads, falling back to BSC");
+    }
+
+    while cur.num_reads > 0 {
         info!("Chunk {}: {} reads (h={} s={} q={} bytes)",
-            chunk_idx, cur_reads, cur_h.len(), cur_s.len(), cur_q.len());
+            chunk_idx, cur.num_reads, cur.header_stream.len(), cur.seq_stream.len(), cur.qual_stream.len());
 
         // Pipeline: compress current chunk on a background thread while
         // reading the next chunk on the main thread.
@@ -671,10 +809,12 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
         // sequences -> qualities) to limit BSC working memory. Raw data for
         // each stream is dropped after compression before starting the next.
         let (next_result, compress_result) = std::thread::scope(|scope| {
-            let h_data = std::mem::take(&mut cur_h);
-            let s_data = std::mem::take(&mut cur_s);
-            let q_data = std::mem::take(&mut cur_q);
-            let rc_data = std::mem::take(&mut cur_rc);
+            let h_data = std::mem::take(&mut cur.header_stream);
+            let s_data = std::mem::take(&mut cur.seq_stream);
+            let q_data = std::mem::take(&mut cur.qual_stream);
+            let rc_data = std::mem::take(&mut cur.rc_flags);
+            let qs = std::mem::take(&mut cur.qual_strings);
+            let ss = std::mem::take(&mut cur.seq_strings);
 
             let compress_handle = scope.spawn(move || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
                 // Compress headers, then free raw header data before starting sequences
@@ -685,10 +825,20 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
                 let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static)?;
                 drop(s_data);
 
-                // Compress qualities (if present)
-                let q_blocks = if no_quality || q_data.is_empty() {
+                // Compress qualities
+                let q_blocks = if no_quality || (q_data.is_empty() && qs.is_empty()) {
                     Vec::new()
+                } else if use_quality_ctx {
+                    drop(q_data); // Don't need packed stream
+                    let qual_refs: Vec<&str> = qs.iter().map(|s| s.as_str()).collect();
+                    let seq_refs: Vec<&str> = ss.iter().map(|s| s.as_str()).collect();
+                    let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
+                    drop(qs);
+                    drop(ss);
+                    vec![blob] // Single blob as one "block"
                 } else {
+                    drop(qs);
+                    drop(ss);
                     compress_stream_to_bsc_blocks(&q_data, bsc_static)?
                 };
 
@@ -704,7 +854,9 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
 
             // Read next chunk on main thread (overlaps with compression)
             let next = read_chunk_streams(
-                &mut reader, CHUNK_SIZE, quality_mode, quality_binning, no_quality, args.sequence_hints, args.sequence_delta, rc_canon,
+                &mut reader, CHUNK_SIZE, quality_mode, quality_binning, no_quality,
+                args.sequence_hints, args.sequence_delta, rc_canon,
+                collect_for_ctx && use_quality_ctx,
             );
 
             let compressed = compress_handle.join().unwrap();
@@ -720,19 +872,12 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
             rc_num_blocks += write_blocks_to_tmp(rc_blk, rc_file)?;
         }
 
-        num_reads += cur_reads;
-        total_bases += cur_bases;
-        original_size += cur_orig;
+        num_reads += cur.num_reads;
+        total_bases += cur.total_bases;
+        original_size += cur.original_size;
         chunk_idx += 1;
 
-        let (nh, ns, nq, nrc, nr, nb, no) = next_result?;
-        cur_h = nh;
-        cur_s = ns;
-        cur_q = nq;
-        cur_rc = nrc;
-        cur_reads = nr;
-        cur_bases = nb;
-        cur_orig = no;
+        cur = next_result?;
     }
 
     // Flush and close temp file writers
@@ -770,7 +915,7 @@ fn compress_chunked_bsc(args: &CompressArgs) -> Result<()> {
     // Write final output
     let encoding_type: u8 = if rc_canon { 6 } else if args.sequence_delta { 5 } else if args.sequence_hints { 4 } else { 0 };
     write_chunked_archive_rc(
-        &args.output, quality_binning, QualityCompressor::Bsc, no_quality, encoding_type,
+        &args.output, quality_binning, quality_compressor_used, no_quality, encoding_type,
         num_reads, headers_len, sequences_len, qualities_len, rc_flags_len,
         h_num_blocks, s_num_blocks, q_num_blocks, rc_num_blocks,
         &h_tmp_path, &s_tmp_path, &q_tmp_path, &rc_tmp_path,
@@ -1563,6 +1708,16 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
         }
     }
 
+    // Validate --quality-compressor quality-ctx
+    if args.quality_compressor == QualityCompressor::QualityCtx {
+        if args.no_quality {
+            anyhow::bail!("--quality-compressor quality-ctx cannot be used with --no-quality");
+        }
+        if args.quality_mode != QualityMode::Lossless {
+            anyhow::bail!("--quality-compressor quality-ctx requires lossless quality mode (default)");
+        }
+    }
+
     // Validate --factorize compatibility
     if args.factorize {
         if args.delta_encoding || args.rle_encoding || args.debruijn || args.arithmetic
@@ -1574,6 +1729,24 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
         }
         if args.header_compressor != HeaderCompressor::Bsc {
             anyhow::bail!("--factorize requires BSC header compressor (default)");
+        }
+    }
+
+    // Validate --local-reorder / --ultra compatibility
+    if args.local_reorder || args.ultra {
+        let mode_name = if args.local_reorder { "--local-reorder" } else { "--ultra" };
+        if args.local_reorder && args.ultra {
+            anyhow::bail!("--local-reorder and --ultra cannot be combined");
+        }
+        if args.factorize || args.delta_encoding || args.rle_encoding || args.debruijn
+            || args.arithmetic || args.sequence_hints || args.sequence_delta || args.rc_canon {
+            anyhow::bail!("{mode_name} cannot be combined with other encoding options");
+        }
+        if args.sequence_compressor != SequenceCompressor::Bsc {
+            anyhow::bail!("{mode_name} requires BSC sequence compressor (default)");
+        }
+        if args.header_compressor != HeaderCompressor::Bsc {
+            anyhow::bail!("{mode_name} requires BSC header compressor (default)");
         }
     }
 
@@ -1599,7 +1772,9 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
         && !args.twobit
         && !args.header_template;
 
-    let can_stream = can_stream_base && args.quality_compressor == QualityCompressor::Bsc;
+    let can_stream = can_stream_base
+        && (args.quality_compressor == QualityCompressor::Bsc
+            || args.quality_compressor == QualityCompressor::QualityCtx);
 
     // Reorder modes require the streaming-compatible BSC base path
     if let Some(mode) = args.reorder {
@@ -1615,6 +1790,16 @@ pub fn compress(args: &CompressArgs) -> Result<()> {
     // Factorize mode: read-to-read delta with inverted index
     if args.factorize {
         return factorize::compress_factorize(args);
+    }
+
+    // Local reorder mode: center-hash grouping + delta encoding
+    if args.local_reorder {
+        return harc::compress_harc(args);
+    }
+
+    // Ultra mode: single large BSC block with parallel BWT (best ratio)
+    if args.ultra {
+        return harc::compress_reorder_local(args);
     }
 
     // Fqzcomp quality needs record-level access, so use chunked record-based path
@@ -2476,7 +2661,7 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
     offset += 1;
 
     // Read quality compressor type (default to zstd for backward compatibility)
-    let quality_compressor = if offset < archive_data.len() && archive_data[offset] <= 3 {
+    let quality_compressor = if offset < archive_data.len() && archive_data[offset] <= 4 {
         let compressor = code_to_compressor(archive_data[offset])?;
         offset += 1;
         compressor
@@ -2765,34 +2950,16 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
 
         records
     } else if encoding_type == 7 {
-        // Factorized mode: 3 sub-streams (meta, raw_seq, delta_seq)
-        // packed in sequences region, each prefixed with u64 length
         info!("Decompressing factorized sequences (encoding_type=7)...");
 
-        let mut soff = 0usize;
+        // Detect format version: v2 starts with version byte 0x02,
+        // v1 starts with u64 meta_size whose LSB is always ≥ 32.
+        let is_v2 = !sequences.is_empty() && sequences[0] == 2;
 
-        // Parse 3 sub-stream slices from sequences region
-        let mut read_sub = |label: &str| -> Result<&[u8]> {
-            if soff + 8 > sequences.len() {
-                anyhow::bail!("Truncated factorized {} length", label);
-            }
-            let len = u64::from_le_bytes(sequences[soff..soff + 8].try_into().unwrap()) as usize;
-            soff += 8;
-            if soff + len > sequences.len() {
-                anyhow::bail!("Truncated factorized {} data (need {}, have {})", label, len, sequences.len() - soff);
-            }
-            let slice = &sequences[soff..soff + len];
-            soff += len;
-            Ok(slice)
-        };
-
-        let meta_compressed = read_sub("meta")?;
-        let raw_seq_compressed = read_sub("raw_seq")?;
-        let delta_seq_compressed = read_sub("delta_seq")?;
-
-        // Parallel decompression of all 5 streams (headers, qualities, meta, raw_seq, delta_seq)
-        let ((header_result, qual_result), (meta_result, (raw_seq_result, delta_seq_result))) = rayon::join(
-            || rayon::join(
+        if is_v2 {
+            // ── Factorize v2: pattern-routed streams ──
+            // Decompress headers + qualities in parallel with sequence decoding
+            let (header_result, qual_result) = rayon::join(
                 || decompress_headers_bsc(headers, num_reads)
                     .context("Failed to decompress headers"),
                 || -> Result<Vec<u8>> {
@@ -2803,56 +2970,196 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
                             .context("Failed to decompress qualities")
                     }
                 },
-            ),
-            || rayon::join(
-                || bsc::decompress_parallel(meta_compressed)
-                    .context("Failed to decompress meta stream"),
+            );
+
+            let read_ids = header_result?;
+            let qualities_data = qual_result?;
+
+            let decoded_sequences = factorize::decode_factorized_sequences_v2(
+                sequences, num_reads)?;
+
+            // Build records
+            let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
+                crate::io::FastqRecord::new(id, seq, None)
+            }).collect();
+
+            // Decode qualities
+            if !qualities_data.is_empty() {
+                let mut qual_offset = 0;
+                for record in &mut records {
+                    if qual_offset < qualities_data.len() {
+                        let q_len = read_varint(&qualities_data, &mut qual_offset)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
+                        let bits_per_qual = quality_binning.bits_per_quality();
+                        let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
+                        if qual_offset + q_encoded_len <= qualities_data.len() {
+                            let quality_str = columnar::unpack_qualities(&qualities_data[qual_offset..qual_offset + q_encoded_len], q_len, quality_binning);
+                            qual_offset += q_encoded_len;
+                            record.quality = Some(quality_str);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            records
+        } else {
+            // ── Factorize v1: 3 sub-streams (meta, raw_seq, delta_seq) ──
+            let mut soff = 0usize;
+
+            let mut read_sub = |label: &str| -> Result<&[u8]> {
+                if soff + 8 > sequences.len() {
+                    anyhow::bail!("Truncated factorized {} length", label);
+                }
+                let len = u64::from_le_bytes(sequences[soff..soff + 8].try_into().unwrap()) as usize;
+                soff += 8;
+                if soff + len > sequences.len() {
+                    anyhow::bail!("Truncated factorized {} data (need {}, have {})", label, len, sequences.len() - soff);
+                }
+                let slice = &sequences[soff..soff + len];
+                soff += len;
+                Ok(slice)
+            };
+
+            let meta_compressed = read_sub("meta")?;
+            let raw_seq_compressed = read_sub("raw_seq")?;
+            let delta_seq_compressed = read_sub("delta_seq")?;
+
+            let ((header_result, qual_result), (meta_result, (raw_seq_result, delta_seq_result))) = rayon::join(
                 || rayon::join(
-                    || bsc::decompress_parallel(raw_seq_compressed)
-                        .context("Failed to decompress raw_seq stream"),
-                    || if delta_seq_compressed.is_empty() { Ok(Vec::new()) }
-                       else { bsc::decompress_parallel(delta_seq_compressed)
-                           .context("Failed to decompress delta_seq stream") },
+                    || decompress_headers_bsc(headers, num_reads)
+                        .context("Failed to decompress headers"),
+                    || -> Result<Vec<u8>> {
+                        if qualities_len == 0 {
+                            Ok(Vec::new())
+                        } else {
+                            decompress_qualities_data(qualities, quality_compressor)
+                                .context("Failed to decompress qualities")
+                        }
+                    },
                 ),
-            ),
+                || rayon::join(
+                    || bsc::decompress_parallel(meta_compressed)
+                        .context("Failed to decompress meta stream"),
+                    || rayon::join(
+                        || bsc::decompress_parallel(raw_seq_compressed)
+                            .context("Failed to decompress raw_seq stream"),
+                        || if delta_seq_compressed.is_empty() { Ok(Vec::new()) }
+                           else { bsc::decompress_parallel(delta_seq_compressed)
+                               .context("Failed to decompress delta_seq stream") },
+                    ),
+                ),
+            );
+
+            let read_ids = header_result?;
+            let meta_data = meta_result?;
+            let raw_seq_data = raw_seq_result?;
+            let delta_seq_data = delta_seq_result?;
+            let qualities_data = qual_result?;
+
+            info!("Reconstructing factorized sequences...");
+            let decoded_sequences = factorize::decode_factorized_sequences(
+                &meta_data, &raw_seq_data, &delta_seq_data, num_reads)?;
+
+            let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
+                crate::io::FastqRecord::new(id, seq, None)
+            }).collect();
+
+            if !qualities_data.is_empty() {
+                let mut qual_offset = 0;
+                for record in &mut records {
+                    if qual_offset < qualities_data.len() {
+                        let q_len = read_varint(&qualities_data, &mut qual_offset)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
+                        let bits_per_qual = quality_binning.bits_per_quality();
+                        let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
+                        if qual_offset + q_encoded_len <= qualities_data.len() {
+                            let quality_str = columnar::unpack_qualities(&qualities_data[qual_offset..qual_offset + q_encoded_len], q_len, quality_binning);
+                            qual_offset += q_encoded_len;
+                            record.quality = Some(quality_str);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            records
+        }
+    } else if encoding_type == 8 || encoding_type == 9 {
+        // Local reorder + delta (8) or ultra/big-block (9): both store permutation for original order restore
+        let mode_name = if encoding_type == 8 { "local-reorder" } else { "ultra" };
+        let use_quality_ctx = quality_compressor == QualityCompressor::QualityCtx;
+        info!("Decompressing {} sequences (encoding_type={}, quality={})...",
+            mode_name, encoding_type, if use_quality_ctx { "quality_ctx" } else { "BSC" });
+
+        // Decode headers and sequences in parallel
+        // (quality_ctx needs sequences as context, so can't decompress qualities in parallel)
+        let (header_result, seq_result) = rayon::join(
+            || decompress_headers_bsc(headers, num_reads)
+                .context("Failed to decompress headers"),
+            || -> Result<harc::HarcDecoded> {
+                if encoding_type == 8 {
+                    harc::decode_harc_sequences(sequences, num_reads)
+                } else {
+                    harc::decode_reorder_local(sequences, num_reads)
+                }
+            },
         );
 
         let read_ids = header_result?;
-        let meta_data = meta_result?;
-        let raw_seq_data = raw_seq_result?;
-        let delta_seq_data = delta_seq_result?;
-        let qualities_data = qual_result?;
+        let decoded = seq_result?;
 
-        info!("Reconstructing factorized sequences...");
-        let decoded_sequences = factorize::decode_factorized_sequences(
-            &meta_data, &raw_seq_data, &delta_seq_data, num_reads)?;
-
-        // Build records
-        let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
-            crate::io::FastqRecord::new(id, seq, None)
-        }).collect();
-
-        // Decode qualities (standard quality decoding)
-        if !qualities_data.is_empty() {
-            let mut qual_offset = 0;
-            for record in &mut records {
-                if qual_offset < qualities_data.len() {
-                    let q_len = read_varint(&qualities_data, &mut qual_offset)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
-                    let bits_per_qual = quality_binning.bits_per_quality();
-                    let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
-                    if qual_offset + q_encoded_len <= qualities_data.len() {
-                        let quality_str = columnar::unpack_qualities(&qualities_data[qual_offset..qual_offset + q_encoded_len], q_len, quality_binning);
-                        qual_offset += q_encoded_len;
-                        record.quality = Some(quality_str);
-                    } else {
-                        break;
+        // Decode qualities (may need sequences for quality_ctx)
+        let mut qual_strings: Vec<Option<String>> = vec![None; num_reads];
+        if qualities_len > 0 {
+            if use_quality_ctx {
+                // Quality_ctx: decompress using sequences as context (in reordered order)
+                let ctx_qualities = quality_ctx::decompress_quality_ctx_multiblock(
+                    qualities, &decoded.sequences,
+                ).context("Failed to decompress qualities (quality_ctx)")?;
+                for (i, q) in ctx_qualities.into_iter().enumerate() {
+                    qual_strings[i] = Some(q);
+                }
+            } else {
+                // BSC: decompress and parse packed quality bytes
+                let qualities_data = decompress_qualities_data(qualities, quality_compressor)
+                    .context("Failed to decompress qualities")?;
+                let mut qual_offset = 0;
+                for i in 0..num_reads {
+                    if qual_offset < qualities_data.len() {
+                        let q_len = read_varint(&qualities_data, &mut qual_offset)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length at read {}", i))?;
+                        let bits_per_qual = quality_binning.bits_per_quality();
+                        let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
+                        if qual_offset + q_encoded_len <= qualities_data.len() {
+                            let quality_str = columnar::unpack_qualities(
+                                &qualities_data[qual_offset..qual_offset + q_encoded_len],
+                                q_len, quality_binning,
+                            );
+                            qual_offset += q_encoded_len;
+                            qual_strings[i] = Some(quality_str);
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        records
+        // Build records in reordered order, then un-permute to original order
+        let mut records: Vec<Option<crate::io::FastqRecord>> = (0..num_reads).map(|_| None).collect();
+        for (reorder_pos, (id, seq)) in read_ids.into_iter()
+            .zip(decoded.sequences.into_iter())
+            .enumerate()
+        {
+            let orig_idx = decoded.order[reorder_pos] as usize;
+            let qual = std::mem::take(&mut qual_strings[reorder_pos]);
+            records[orig_idx] = Some(crate::io::FastqRecord { id, sequence: seq, quality: qual });
+        }
+
+        records.into_iter().map(|r| r.unwrap()).collect()
     } else if encoding_type == 1 || encoding_type == 2 {
         // Delta or RLE mode: decompress all streams in parallel
         let ((header_result, seq_result), qual_result) = rayon::join(
@@ -2999,8 +3306,10 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
     } else {
         // Normal mode: decompress all streams in parallel
         info!("Decompressing streams in parallel...");
+        let use_quality_ctx = quality_compressor == QualityCompressor::QualityCtx;
 
         // Step 1: Parallel decompression of headers, sequences, qualities
+        // For quality_ctx: skip quality decompression here (needs sequences first)
         let (header_result, (seq_result, qual_result)) = rayon::join(
             || -> Result<Vec<String>> {
                 match header_compressor {
@@ -3087,7 +3396,7 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
                     }
                 },
                 || -> Result<Vec<u8>> {
-                    if qualities_len == 0 {
+                    if use_quality_ctx || qualities_len == 0 {
                         Ok(Vec::new())
                     } else if let Some(ref dict) = quality_dict_opt {
                         zstd_dict::decompress_with_dict(qualities, dict)
@@ -3104,13 +3413,29 @@ pub fn decompress(args: &DecompressArgs) -> Result<()> {
         let decoded_sequences = seq_result?;
         let qualities_data = qual_result?;
 
+        // For quality_ctx: decompress qualities using sequences as context
+        // Must happen after sequences are available (breaks seq||qual parallelism)
+        let quality_ctx_strings = if use_quality_ctx {
+            info!("Decompressing quality scores (quality_ctx)...");
+            Some(quality_ctx::decompress_quality_ctx_multiblock(qualities, &decoded_sequences)
+                .context("Failed to decompress quality scores (quality_ctx)")?)
+        } else {
+            None
+        };
+
         // Step 2: Construct records from decoded headers and sequences
         let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
             crate::io::FastqRecord::new(id, seq, None)
         }).collect();
 
         // Step 3: Decode quality strings and attach to records
-        if !qualities_data.is_empty() {
+        if let Some(quality_strings) = quality_ctx_strings {
+            for (i, qual) in quality_strings.into_iter().enumerate() {
+                if i < records.len() {
+                    records[i].quality = Some(qual);
+                }
+            }
+        } else if !qualities_data.is_empty() {
             if quality_delta_enabled {
                 let mut encoded_deltas = Vec::new();
                 let mut qual_offset = 0;
@@ -3530,6 +3855,7 @@ pub(crate) fn compress_qualities_with(records: &[crate::io::FastqRecord], binnin
         QualityCompressor::Bsc => bsc_compress_parallel(&quality_stream, bsc_static),
         QualityCompressor::OpenZl => openzl::compress_parallel(&quality_stream),
         QualityCompressor::Fqzcomp => unreachable!(),
+        QualityCompressor::QualityCtx => unreachable!("quality_ctx handled separately"),
     }
 }
 
@@ -3571,6 +3897,7 @@ fn compress_qualities_with_dict(
             info!("Note: fqzcomp doesn't support dictionary mode, using standard fqzcomp");
             compress_qualities_fqzcomp(records)
         }
+        QualityCompressor::QualityCtx => unreachable!("quality_ctx handled separately"),
     }
 }
 
@@ -3620,6 +3947,7 @@ fn compress_qualities_with_model(
             info!("Note: fqzcomp doesn't support quality modeling, using BSC for model deltas");
             bsc_compress_parallel(&quality_stream, bsc_static)?
         }
+        QualityCompressor::QualityCtx => unreachable!("quality_ctx handled separately"),
     };
 
     Ok((compressed, model))
@@ -3716,6 +4044,7 @@ fn decompress_qualities_data(compressed: &[u8], compressor: QualityCompressor) -
         QualityCompressor::Bsc => bsc::decompress_parallel(compressed),
         QualityCompressor::OpenZl => openzl::decompress_parallel(compressed),
         QualityCompressor::Fqzcomp => decompress_qualities_fqzcomp_multiblock(compressed),
+        QualityCompressor::QualityCtx => unreachable!("quality_ctx decompression handled separately"),
     }
 }
 
