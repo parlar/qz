@@ -654,7 +654,7 @@ fn bsc_decompress_from_blob(data: &[u8], off: &mut usize) -> Result<Vec<u8>> {
     if *off + 4 > data.len() {
         anyhow::bail!("truncated BSC blob");
     }
-    let num_blocks = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap()) as usize;
+    let num_blocks = super::read_le_u32(data, *off)? as usize;
     *off += 4;
 
     let mut result = Vec::new();
@@ -662,7 +662,7 @@ fn bsc_decompress_from_blob(data: &[u8], off: &mut usize) -> Result<Vec<u8>> {
         if *off + 4 > data.len() {
             anyhow::bail!("truncated BSC block length");
         }
-        let block_len = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap()) as usize;
+        let block_len = super::read_le_u32(data, *off)? as usize;
         *off += 4;
         if *off + block_len > data.len() {
             anyhow::bail!("truncated BSC block data");
@@ -1107,7 +1107,10 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
                 }
             }
 
-            let compressed = compress_handle.join().unwrap();
+            let compressed = match compress_handle.join() {
+                Ok(v) => v,
+                Err(e) => std::panic::resume_unwind(e),
+            };
             (next, compressed)
         });
 
@@ -1236,7 +1239,7 @@ fn decode_chunked(seq_region: &[u8], num_reads: usize, is_delta: bool) -> Result
         anyhow::bail!("HARC: sequences region too small");
     }
 
-    let num_chunks = u32::from_le_bytes(seq_region[..4].try_into().unwrap()) as usize;
+    let num_chunks = super::read_le_u32(seq_region, 0)? as usize;
     let mut off = 4usize;
 
     // Phase 1: parse chunk boundaries (fast, sequential pointer math)
@@ -1245,7 +1248,7 @@ fn decode_chunked(seq_region: &[u8], num_reads: usize, is_delta: bool) -> Result
         if off + 4 > seq_region.len() {
             anyhow::bail!("HARC: truncated chunk {} length", chunk_idx);
         }
-        let chunk_len = u32::from_le_bytes(seq_region[off..off + 4].try_into().unwrap()) as usize;
+        let chunk_len = super::read_le_u32(seq_region, off)? as usize;
         off += 4;
         if off + chunk_len > seq_region.len() {
             anyhow::bail!("HARC: truncated chunk {} data", chunk_idx);
@@ -1307,7 +1310,7 @@ fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
         if off + 4 > data.len() {
             anyhow::bail!("HARC: truncated stream {} num_blocks", i);
         }
-        let num_blocks = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        let num_blocks = super::read_le_u32(data, off)? as usize;
         off += 4;
 
         let mut blocks = Vec::with_capacity(num_blocks);
@@ -1315,7 +1318,7 @@ fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
             if off + 4 > data.len() {
                 anyhow::bail!("HARC: truncated stream {} block {} length", i, b);
             }
-            let block_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            let block_len = super::read_le_u32(data, off)? as usize;
             off += 4;
             if off + block_len > data.len() {
                 anyhow::bail!("HARC: truncated stream {} block {} data", i, b);
@@ -1356,7 +1359,7 @@ fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
 fn parse_order(order_data: &[u8]) -> Vec<u32> {
     let n = order_data.len() / 4;
     (0..n).map(|i| {
-        u32::from_le_bytes(order_data[i * 4..(i + 1) * 4].try_into().unwrap())
+        super::read_le_u32(order_data, i * 4).unwrap_or(0)
     }).collect()
 }
 
@@ -1378,7 +1381,7 @@ fn decode_chunk_reorder_local(data: &[u8]) -> Result<(Vec<String>, Vec<u32>)> {
         if off + 4 > data.len() {
             anyhow::bail!("reorder-local: truncated arith length");
         }
-        let arith_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        let arith_len = super::read_le_u32(data, off)? as usize;
         off += 4;
         if off + arith_len > data.len() {
             anyhow::bail!("reorder-local: truncated arith data");

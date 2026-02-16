@@ -276,7 +276,7 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         anyhow::bail!("BSC parallel: data too small for header");
     }
 
-    let num_blocks = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let num_blocks = super::read_le_u32(data, 0)? as usize;
 
     // First pass: collect block slices (sequential, just pointer math)
     let mut offset = 4;
@@ -285,7 +285,7 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         if offset + 4 > data.len() {
             anyhow::bail!("BSC parallel: truncated block length");
         }
-        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let block_len = super::read_le_u32(data, offset)? as usize;
         offset += 4;
 
         if offset + block_len > data.len() {

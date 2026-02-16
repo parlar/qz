@@ -68,3 +68,7 @@ path = "src/bin/bench_sort_strategies.rs"
 [[bin]]
 name = "bench_template"
 path = "src/bin/bench_template.rs"
+
+[[bin]]
+name = "bench_qctx_blocksize"
+path = "../../benchmarks/bench_qctx_blocksize.rs"

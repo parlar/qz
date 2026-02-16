@@ -54,8 +54,6 @@ pub struct CompressConfig {
     pub header_compressor: HeaderCompressor,
     /// Use BSC static coder instead of adaptive
     pub bsc_static: bool,
-    /// Use chunked streaming mode for lower memory usage
-    pub chunked: bool,
     /// Use 2-bit sequence encoding (4 bases per byte + N-mask bitmap)
     pub twobit: bool,
     /// Use template-based header encoding
@@ -76,6 +74,8 @@ pub struct CompressConfig {
     pub ultra: Option<u8>,
     /// Deprecated: use ultra level 2 instead
     pub fast_ultra: bool,
+    /// Number of reads per quality_ctx sub-block (default 500K)
+    pub quality_ctx_block_size: usize,
 }
 
 impl Default for CompressConfig {
@@ -103,7 +103,6 @@ impl Default for CompressConfig {
             sequence_compressor: SequenceCompressor::Bsc,
             header_compressor: HeaderCompressor::Bsc,
             bsc_static: false,
-            chunked: false,
             twobit: false,
             header_template: false,
             rc_canon: false,
@@ -114,6 +113,7 @@ impl Default for CompressConfig {
             local_reorder: false,
             ultra: None,
             fast_ultra: false,
+            quality_ctx_block_size: 500_000,
         }
     }
 }

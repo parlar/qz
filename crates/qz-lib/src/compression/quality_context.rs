@@ -367,11 +367,11 @@ pub fn decompress_parallel(
 
     let block_size = 100_000;
 
-    let num_blocks = u32::from_le_bytes(compressed[0..4].try_into().unwrap()) as usize;
+    let num_blocks = super::read_le_u32(compressed, 0)? as usize;
     let mut offset = 4;
     let mut block_lens = Vec::with_capacity(num_blocks);
     for _ in 0..num_blocks {
-        let blen = u32::from_le_bytes(compressed[offset..offset + 4].try_into().unwrap()) as usize;
+        let blen = super::read_le_u32(compressed, offset)? as usize;
         block_lens.push(blen);
         offset += 4;
     }

@@ -410,7 +410,7 @@ pub fn decompress_quality_ctx_multiblock(
         return Ok(Vec::new());
     }
 
-    let num_blocks = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let num_blocks = super::read_le_u32(data, 0)? as usize;
     let mut offset = 4;
 
     // Phase 1: parse block boundaries and compute sequence ranges (fast, sequential)
@@ -421,7 +421,7 @@ pub fn decompress_quality_ctx_multiblock(
         if offset + 4 > data.len() {
             anyhow::bail!("quality_ctx multiblock: truncated block length");
         }
-        let block_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let block_len = super::read_le_u32(data, offset)? as usize;
         offset += 4;
 
         if offset + block_len > data.len() {
@@ -433,9 +433,7 @@ pub fn decompress_quality_ctx_multiblock(
         // Extract num_reads from blob header: [n_symbols:1B][symbols:nB][read_len:2B][num_reads:4B]
         let n_symbols = blob[0] as usize;
         let nr_offset = 1 + n_symbols + 2;
-        let chunk_reads = u32::from_le_bytes(
-            blob[nr_offset..nr_offset + 4].try_into().unwrap()
-        ) as usize;
+        let chunk_reads = super::read_le_u32(blob, nr_offset)? as usize;
 
         block_info.push((blob, seq_cursor, chunk_reads));
         seq_cursor += chunk_reads;

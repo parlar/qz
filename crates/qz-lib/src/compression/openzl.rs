@@ -403,7 +403,10 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         anyhow::bail!("OpenZL parallel: data too small for header");
     }
 
-    let num_blocks = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let num_blocks = u32::from_le_bytes(
+        data[0..4].try_into()
+            .map_err(|_| anyhow::anyhow!("OpenZL parallel: truncated header"))?,
+    ) as usize;
 
     // First pass: collect block slices (sequential, just pointer math)
     let mut offset = 4;
@@ -412,8 +415,10 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         if offset + 4 > data.len() {
             anyhow::bail!("OpenZL parallel: truncated block length");
         }
-        let block_len =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let block_len = u32::from_le_bytes(
+            data[offset..offset + 4].try_into()
+                .map_err(|_| anyhow::anyhow!("OpenZL parallel: truncated block length"))?,
+        ) as usize;
         offset += 4;
 
         if offset + block_len > data.len() {

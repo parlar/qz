@@ -151,11 +151,12 @@ pub(super) fn compress_factorize(args: &crate::cli::CompressConfig) -> Result<()
             });
 
             let next = read_chunk_records(&mut reader, CHUNK_SIZE);
-            let compressed = compress_handle.join().unwrap();
+            let compressed = compress_handle.join()
+                .map_err(|e| anyhow::anyhow!("factorize compression thread panicked: {e:?}"));
             (next, compressed)
         });
 
-        let chunk = compress_result?;
+        let chunk = compress_result??;
 
         h_num_blocks += write_blocks_to_tmp(chunk.h_blocks, &mut h_tmp)?;
         ms_num_blocks += write_blocks_to_tmp(chunk.ms_blocks, &mut ms_tmp)?;
@@ -398,7 +399,10 @@ pub(super) fn decode_factorized_sequences_v2(
     if off + 8 > seq_region.len() {
         anyhow::bail!("Factorize v2: truncated routing length");
     }
-    let routing_len = u64::from_le_bytes(seq_region[off..off + 8].try_into().unwrap()) as usize;
+    let routing_len = u64::from_le_bytes(
+        seq_region[off..off + 8].try_into()
+            .map_err(|_| anyhow::anyhow!("Factorize v2: truncated routing length bytes"))?,
+    ) as usize;
     off += 8;
     if off + routing_len > seq_region.len() {
         anyhow::bail!("Factorize v2: truncated routing data");
@@ -410,7 +414,10 @@ pub(super) fn decode_factorized_sequences_v2(
     if off + 8 > seq_region.len() {
         anyhow::bail!("Factorize v2: truncated main seq length");
     }
-    let main_len = u64::from_le_bytes(seq_region[off..off + 8].try_into().unwrap()) as usize;
+    let main_len = u64::from_le_bytes(
+        seq_region[off..off + 8].try_into()
+            .map_err(|_| anyhow::anyhow!("Factorize v2: truncated main seq length bytes"))?,
+    ) as usize;
     off += 8;
     if off + main_len > seq_region.len() {
         anyhow::bail!("Factorize v2: truncated main seq data");
@@ -422,7 +429,10 @@ pub(super) fn decode_factorized_sequences_v2(
     if off + 8 > seq_region.len() {
         anyhow::bail!("Factorize v2: truncated pattern seq length");
     }
-    let pattern_len = u64::from_le_bytes(seq_region[off..off + 8].try_into().unwrap()) as usize;
+    let pattern_len = u64::from_le_bytes(
+        seq_region[off..off + 8].try_into()
+            .map_err(|_| anyhow::anyhow!("Factorize v2: truncated pattern seq length bytes"))?,
+    ) as usize;
     off += 8;
     if off + pattern_len > seq_region.len() {
         anyhow::bail!("Factorize v2: truncated pattern seq data");
