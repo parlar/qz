@@ -55,11 +55,11 @@ fn main() {
     {
         let raw: Vec<u8> = sequences.iter().flat_map(|s| s.as_bytes().iter().copied()).collect();
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&raw).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&raw).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let decompressed = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let decompressed = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
         assert_eq!(raw, decompressed);
 
@@ -70,19 +70,19 @@ fn main() {
     {
         let seqs_bytes: Vec<Vec<u8>> = sequences.iter().map(|s| s.as_bytes().to_vec()).collect();
         let t = Instant::now();
-        let packed = qz::compression::dna_utils::pack_dna_2bit(&seqs_bytes);
+        let packed = qz_lib::compression::dna_utils::pack_dna_2bit(&seqs_bytes);
         let pack_time = t.elapsed();
 
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&packed).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&packed).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let decompressed = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let decompressed = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         // Verify roundtrip
-        let (unpacked, _) = qz::compression::dna_utils::unpack_dna_2bit(&decompressed, 0).unwrap();
+        let (unpacked, _) = qz_lib::compression::dna_utils::unpack_dna_2bit(&decompressed, 0).unwrap();
         for (i, (orig, dec)) in sequences.iter().zip(unpacked.iter()).enumerate() {
             assert_eq!(orig.as_bytes(), dec.as_slice(), "2-bit roundtrip mismatch at read {}", i);
         }
@@ -106,11 +106,11 @@ fn main() {
         let transpose_time = t.elapsed();
 
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&columnar).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&columnar).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let decompressed = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let decompressed = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         // Verify roundtrip
@@ -139,11 +139,11 @@ fn main() {
         let pack_time = t.elapsed();
 
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&packed).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&packed).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let decompressed = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let decompressed = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         // Verify roundtrip (N bases map to A — lossy, N's go in separate stream in QZ)
@@ -175,12 +175,12 @@ fn main() {
     // === 5. Greedy contig builder + BSC ===
     {
         let t = Instant::now();
-        let compressed = qz::compression::greedy_contig::compress_sequences_greedy(&sequences).unwrap();
+        let compressed = qz_lib::compression::greedy_contig::compress_sequences_greedy(&sequences).unwrap();
         let comp_time = t.elapsed();
 
         // Decompress uses same DBG1 format as de Bruijn
         let t2 = Instant::now();
-        let decompressed = qz::compression::debruijn::decompress_sequences_debruijn(&compressed, num_reads).unwrap();
+        let decompressed = qz_lib::compression::debruijn::decompress_sequences_debruijn(&compressed, num_reads).unwrap();
         let decomp_time = t2.elapsed();
 
         // Verify roundtrip
@@ -194,11 +194,11 @@ fn main() {
     // === 5b. De Bruijn graph encoding (skip if > 200K reads — too slow) ===
     if num_reads <= 200_000 {
         let t = Instant::now();
-        let compressed = qz::compression::debruijn::compress_sequences_debruijn(&sequences, 0).unwrap();
+        let compressed = qz_lib::compression::debruijn::compress_sequences_debruijn(&sequences, 0).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let decompressed = qz::compression::debruijn::decompress_sequences_debruijn(&compressed, num_reads).unwrap();
+        let decompressed = qz_lib::compression::debruijn::decompress_sequences_debruijn(&compressed, num_reads).unwrap();
         let decomp_time = t2.elapsed();
 
         for (i, (orig, dec)) in sequences.iter().zip(decompressed.iter()).enumerate() {
@@ -218,12 +218,12 @@ fn main() {
         let subset_bases: usize = subset.iter().map(|s| s.len()).sum();
 
         let t = Instant::now();
-        let compressed = qz::compression::arithmetic_sequence::encode_sequences_arithmetic(&subset).unwrap();
+        let compressed = qz_lib::compression::arithmetic_sequence::encode_sequences_arithmetic(&subset).unwrap();
         let comp_time = t.elapsed();
 
         let read_lengths: Vec<usize> = subset.iter().map(|s| s.len()).collect();
         let t2 = Instant::now();
-        let decompressed = qz::compression::arithmetic_sequence::decode_sequences_arithmetic(
+        let decompressed = qz_lib::compression::arithmetic_sequence::decode_sequences_arithmetic(
             &compressed,
             &read_lengths,
             subset.len(),
@@ -251,11 +251,11 @@ fn main() {
         let sort_time = t.elapsed();
 
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&sorted_stream).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&sorted_stream).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let _ = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let _ = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         print_row_extra(
@@ -286,11 +286,11 @@ fn main() {
         let sort_time = t.elapsed();
 
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&sorted_stream).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&sorted_stream).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let _ = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let _ = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         print_row_extra(
@@ -318,11 +318,11 @@ fn main() {
         let sort_time = t.elapsed();
 
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&columnar).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&columnar).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let _ = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let _ = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         print_row_extra(
@@ -428,8 +428,8 @@ fn canonical_minimizer(seq: &[u8], k: usize, w: usize) -> u64 {
         let end = (start + w).min(seq.len().saturating_sub(k - 1));
         for pos in start..end {
             let kmer = &seq[pos..pos + k];
-            if let Some(fwd) = qz::compression::dna_utils::kmer_to_hash(kmer) {
-                let rc = qz::compression::dna_utils::reverse_complement_hash(fwd, k);
+            if let Some(fwd) = qz_lib::compression::dna_utils::kmer_to_hash(kmer) {
+                let rc = qz_lib::compression::dna_utils::reverse_complement_hash(fwd, k);
                 let canon = fwd.min(rc);
                 if canon < min_hash {
                     min_hash = canon;

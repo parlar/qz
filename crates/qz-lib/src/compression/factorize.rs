@@ -71,7 +71,7 @@ fn learn_patterns<R: std::io::BufRead>(
 
 // ── Pass 2: Route and compress ──────────────────────────────────────────
 
-pub(super) fn compress_factorize(args: &crate::cli::CompressArgs) -> Result<()> {
+pub(super) fn compress_factorize(args: &crate::cli::CompressConfig) -> Result<()> {
     use std::io::{Write, BufWriter};
 
     let start_time = Instant::now();

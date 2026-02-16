@@ -49,7 +49,7 @@ fn main() {
         .collect();
 
     let t = Instant::now();
-    let raw_bsc = qz::compression::bsc::compress_parallel_adaptive(&raw_qual_stream).unwrap();
+    let raw_bsc = qz_lib::compression::bsc::compress_parallel_adaptive(&raw_qual_stream).unwrap();
     let raw_time = t.elapsed();
     println!(
         "Raw qualities + BSC:          {:>10} B  ({:.2}x)  {:.1}ms",
@@ -64,12 +64,12 @@ fn main() {
     let residual_time = t.elapsed();
 
     let t = Instant::now();
-    let residual_bsc = qz::compression::bsc::compress_parallel_adaptive(&residuals).unwrap();
+    let residual_bsc = qz_lib::compression::bsc::compress_parallel_adaptive(&residuals).unwrap();
     let bsc_time = t.elapsed();
 
     // Verify roundtrip
     let dec_residuals =
-        qz::compression::bsc::decompress_parallel(&residual_bsc).unwrap();
+        qz_lib::compression::bsc::decompress_parallel(&residual_bsc).unwrap();
     let reconstructed = reconstruct_from_residuals(&dec_residuals, &qualities);
     assert_eq!(qualities, reconstructed, "Quality residual roundtrip FAILED");
 
@@ -95,7 +95,7 @@ fn main() {
         .collect();
 
     let t = Instant::now();
-    let unsorted_bsc = qz::compression::bsc::compress_parallel_adaptive(&unsorted_stream).unwrap();
+    let unsorted_bsc = qz_lib::compression::bsc::compress_parallel_adaptive(&unsorted_stream).unwrap();
     let unsorted_time = t.elapsed();
     println!(
         "Unsorted sequences + BSC:     {:>10} B  ({:.2}x)  {:.1}ms",
@@ -116,7 +116,7 @@ fn main() {
         .collect();
 
     let t = Instant::now();
-    let sorted_bsc = qz::compression::bsc::compress_parallel_adaptive(&sorted_stream).unwrap();
+    let sorted_bsc = qz_lib::compression::bsc::compress_parallel_adaptive(&sorted_stream).unwrap();
     let sorted_bsc_time = t.elapsed();
     println!(
         "Lex-sorted sequences + BSC:   {:>10} B  ({:.2}x)  {:.1}ms (sort: {:.1}ms + BSC: {:.1}ms)",

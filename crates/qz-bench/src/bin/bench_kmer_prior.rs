@@ -18,7 +18,7 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use qz::compression::bsc;
+use qz_lib::compression::bsc;
 use rayon::prelude::*;
 
 // ── Base encoding ────────────────────────────────────────────────────────
@@ -584,10 +584,10 @@ fn main() {
 
     // Train table on sorted data (same data, different order shouldn't matter for counts)
     // Use the best k from strategy C
-    let best_table = &tables[best_k - 1]; // tables[0] is k=1
+    let _best_table = &tables[best_k - 1]; // tables[0] is k=1
 
     // Also try training on sorted data specifically
-    let sorted_seqs_owned: Vec<Vec<u8>> = sorted_seqs.iter().map(|s| s.to_vec()).collect();
+    let _sorted_seqs_owned: Vec<Vec<u8>> = sorted_seqs.iter().map(|s| s.to_vec()).collect();
 
     for table in &tables {
         let k = table.k;

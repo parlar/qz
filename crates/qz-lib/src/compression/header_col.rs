@@ -17,9 +17,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::Write;
 
-// When included via #[path] in a binary, use the library crate name.
-// When integrated into the library, change to `use crate::compression::bsc;`
-use qz::compression::bsc;
+use crate::compression::bsc;
 
 /// Header format detected from parsing
 #[derive(Debug, Clone, Copy, PartialEq)]

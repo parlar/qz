@@ -8,10 +8,10 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use qz::compression::bsc;
-use qz::compression::dna_utils::{kmer_to_hash, reverse_complement_hash};
-use qz::compression::fqzcomp;
-use qz::compression::template::{compress_sequences_template_hybrid, TemplateParams};
+use qz_lib::compression::bsc;
+use qz_lib::compression::dna_utils::{kmer_to_hash, reverse_complement_hash};
+use qz_lib::compression::fqzcomp;
+use qz_lib::compression::template::{compress_sequences_template_hybrid, TemplateParams};
 use rayon::prelude::*;
 
 fn main() {

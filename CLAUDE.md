@@ -3,8 +3,40 @@
 ## Build & Environment
 - Edition 2024 requires **nightly Rust**: `rustup install nightly`
 - C++ dependency: `third_party/libbsc/` (clone from https://github.com/IlyaGrebnov/libbsc.git)
-- Build: `cargo build --release` (build.rs compiles libbsc as static C++ lib, linked via FFI)
+- Cargo workspace with 4 crates: `qz-lib`, `qz-cli`, `qz-bench`, `qz-python`
+- Build: `cargo build --release` (build.rs in qz-lib compiles libbsc as static C++ lib, linked via FFI)
 - Release profile: LTO "fat", 1 codegen unit, panic="abort", stripped
+
+## Workspace Structure
+
+```
+qz/
+├── Cargo.toml                   (workspace root)
+├── third_party/                 (libbsc, htscodecs)
+├── crates/
+│   ├── qz-lib/                  (library: all algorithms)
+│   │   ├── Cargo.toml
+│   │   ├── build.rs             (compiles libbsc + htscodecs)
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── cli.rs           (CompressConfig, DecompressConfig, enums — NO Clap)
+│   │   │   ├── compression/     (all modules)
+│   │   │   └── io/              (fastq.rs)
+│   │   └── tests/
+│   │       └── integration_test.rs
+│   ├── qz-cli/                  (binary: slim CLI → produces `qz` executable)
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
+│   ├── qz-python/               (PyO3 cdylib, built with maturin)
+│   │   ├── Cargo.toml
+│   │   ├── pyproject.toml
+│   │   └── src/lib.rs
+│   └── qz-bench/                (bench binaries)
+│       ├── Cargo.toml
+│       └── src/bin/             (14 bench_*.rs files)
+├── benchmarks/                  (benchmark scripts and results)
+└── real_data/                   (test data)
+```
 
 ## Architecture Overview
 
@@ -20,15 +52,16 @@ FASTQ input
 All three streams compress **in parallel** via `rayon::join` (headers parallel with nested seq+qual).
 
 ### Key Files
-- `src/cli/mod.rs` - Clap-based CLI: compress, decompress subcommands
-- `src/compression/mod.rs` - Main orchestrator (~2400 lines), compress() and decompress()
-- `src/compression/bsc.rs` - FFI bindings to libbsc; `compress_parallel` / `decompress_parallel` split into 25 MB blocks
-- `src/io/fastq.rs` - `FastqRecord { id, sequence, quality: Option<String> }`
-- `tests/integration_test.rs` - 11 roundtrip tests (~760 lines)
+- `crates/qz-lib/src/cli.rs` - CompressConfig, DecompressConfig, enums (no Clap)
+- `crates/qz-lib/src/compression/mod.rs` - Main orchestrator (~2400 lines), compress() and decompress()
+- `crates/qz-lib/src/compression/bsc.rs` - FFI bindings to libbsc; `compress_parallel` / `decompress_parallel` split into 25 MB blocks
+- `crates/qz-lib/src/io/fastq.rs` - `FastqRecord { id, sequence, quality: Option<String> }`
+- `crates/qz-lib/tests/integration_test.rs` - 30 roundtrip tests
+- `crates/qz-cli/src/main.rs` - Clap CLI (only production features: default, ultra, illumina-bin, discard)
 
 ### Module Visibility
-- **Private** (internal, access via `super::`): columnar, delta, n_mask, quality, quality_delta, quality_model, read_id, rle, zstd_dict
-- **Public**: arithmetic_quality, arithmetic_sequence, bsc, debruijn, dna_utils, paired_end
+- **Private** (internal, access via `super::`): columnar, delta, n_mask, quality, quality_delta, quality_model, read_id, rle, zstd_dict, factorize, ultra
+- **Public**: arithmetic_quality, arithmetic_sequence, bsc, debruijn, dna_utils, fqzcomp, greedy_contig, header_col, openzl, paired_end, quality_context, quality_ctx, template
 
 ## Key Design Decisions
 
@@ -73,8 +106,11 @@ All three streams compress **in parallel** via `rayon::join` (headers parallel w
 
 Compressor codes: zstd=0, bsc=1. Header compressor: zstd=0 (template+zstd), bsc=1 (raw+bsc).
 
-## CompressArgs Gotcha
-When adding new fields to `CompressArgs`, you must update ALL constructors in `tests/integration_test.rs` (12+ instances, some nested in for loops with different indentation). Search for `CompressArgs {` to find them all.
+## CompressConfig Gotcha
+When adding new fields to `CompressConfig` in `crates/qz-lib/src/cli.rs`, you must update:
+1. The `Default` impl in `cli.rs`
+2. ALL constructors in `crates/qz-lib/tests/integration_test.rs` (12+ instances). Search for `CompressConfig {` to find them all.
+3. The `into_config()` method in `crates/qz-cli/src/main.rs`
 
 ## Compression Performance (1M reads, 150bp WGS)
 | Tool | Ratio | Compress | Decompress |

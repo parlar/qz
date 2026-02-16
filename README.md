@@ -1,286 +1,224 @@
 # QZ
 
-High-performance FASTQ compression using columnar encoding and BSC/BWT.
+Order-preserving FASTQ compression using columnar stream separation and block-sorting transforms.
 
+## Overview
 
-** do not use in production **
+QZ decomposes each FASTQ record into three streams — headers, DNA sequences, and quality scores — and compresses each independently. The primary compression engine is [libbsc](https://github.com/IlyaGrebnov/libbsc) (Grebnov), which applies the Burrows-Wheeler Transform followed by Quantized Local Frequency Coding (QLFC). Separating the streams allows the BWT to operate on large, statistically homogeneous blocks: DNA sequences from the same organism share extensive k-mer content, and the BWT clusters these shared substrings, producing long runs amenable to entropy coding. On raw DNA sequences, this achieves ~1.85 bits per base without read reordering.
 
-QZ is under active development and the documentation below in not fully accurate. The code is currently messy but will be cleaned up shortly. Bear with me. It is released as open source anyway as it is.
+For quality scores, QZ implements a context-adaptive range coder (`quality_ctx`) that conditions on read position, previous quality value, a stability flag, and the local DNA sequence context. This exploits the strong positional and sequential correlations in Illumina quality profiles that block-sorting alone cannot capture, reducing quality stream size by ~7% relative to BSC.
 
+All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) and compressed in parallel via [rayon](https://github.com/rayon-rs/rayon). Input is read in 2.5M-record chunks with pipelined I/O. Read order is preserved.
 
-QZ splits FASTQ records into three independent streams — headers, sequences, and quality scores — and compresses each using [libbsc](https://github.com/IlyaGrebnov/libbsc)'s block-sorting transform with adaptive coding. All three streams compress in parallel. Read order is preserved.
+## Results
 
-## Why QZ?
+10M reads, 150 bp, whole-genome sequencing (ERR3239334), 3,492 MB uncompressed. 72-core machine, sequential runs, byte-identical roundtrip verified via MD5.
 
-Most FASTQ compressors treat reads as opaque byte streams and hand them to a general-purpose compressor like gzip or zstd. This ignores the structure of the data: headers follow predictable templates, DNA sequences are drawn from a 4–5 letter alphabet with strong local correlation, and quality scores have their own distinct statistical profile. Mixing all three into a single stream forces the compressor to model very different distributions at once, leaving compression ratio on the table.
+| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
+|------|-----------|-------|----------|----------|------------|---------|
+| **QZ default** | 446 | **7.83x** | 20.5 s | 5.2 GB | 14.9 s | 6.9 GB |
+| **QZ ultra 3** | 416 | **8.39x** | 37.2 s | 16.1 GB | 20.7 s | 8.5 GB |
+| SPRING | 431 | 8.10x | 66.1 s | 12.0 GB | 16.5 s | 10.0 GB |
+| bzip2 -9 | 542 | 6.44x | 178.6 s | 7.3 MB | 90.7 s | 4.5 MB |
+| pigz -9 | 695 | 5.02x | 10.1 s | 23.1 MB | 8.0 s | 1.7 MB |
 
-QZ takes a columnar approach instead. Each FASTQ record is split into its three constituent streams, and each stream is compressed independently with the algorithm best suited to it. The key insight is that the Burrows-Wheeler Transform — the same algorithm behind bzip2 — is remarkably effective on genomic data when applied to large, homogeneous blocks. DNA sequences from the same organism share vast amounts of k-mer content, and the BWT naturally clusters these shared substrings together, creating long runs that compress extremely well.
+SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results.txt`](benchmarks/results.txt).
 
-The engine behind this is [libbsc](https://github.com/IlyaGrebnov/libbsc), a block-sorting compression library by **Ilya Grebnov**. libbsc pairs a fast BWT implementation (built on Grebnov's [libsais](https://github.com/IlyaGrebnov/libsais) suffix array library) with Lempel-Ziv Prediction (LZP) and Quantized Local Frequency Coding (QLFC), a combination that consistently outperforms zstd on structured genomic data. On raw DNA sequences, BSC achieves ~1.85 bits per base — close to the theoretical limit for order-preserving compression without read reordering.
+## Method
 
-QZ wraps libbsc in a parallel pipeline: each data stream is split into 25 MB blocks that are compressed independently via rayon, giving near-linear scaling across cores. The result is a compressor that approaches the ratio of research tools like SPRING while running an order of magnitude faster and using a fraction of the memory — without sacrificing original read order.
+### Stream separation
 
+Each FASTQ record contributes to three independent byte streams:
 
-## Features
+```
+FASTQ record
+    ├─ Header   (@SRR... instrument/run/flowcell/...)
+    ├─ Sequence  (ACGTN...)
+    └─ Quality   (Phred+33 ASCII)
+```
 
-- **Columnar encoding** — headers, sequences, and qualities compressed independently
-- **BSC/BWT compression** with adaptive QLFC (default) or static QLFC
-- **Lossless roundtrip** — bit-exact reconstruction of the original FASTQ
-- **Lossy quality modes** — Illumina 8-level binning, 4-level, binary, QVZ, or full discard
-- **Ultra mode** — maximum compression with read reordering and de Bruijn graph encoding
-- **Paired-end support** — compress and decompress read pairs
-- **Chunked streaming** (`--chunked`) — constant-memory compression for arbitrarily large files
-- **Multithreaded** — parallel compression and decompression via rayon
-- **Gzipped I/O** — read gzipped FASTQ input, write gzipped FASTQ output
-- **FASTA support** — compress FASTA files (no quality scores)
+Headers, sequences, and qualities are concatenated separately, then each stream is split into 25 MB blocks and compressed in parallel using libbsc's adaptive BWT + QLFC pipeline. The three streams are compressed concurrently via `rayon::join`.
 
-## Requirements
+### Quality score compression
 
-- **Rust nightly** (edition 2024)
-- **C++ compiler** with OpenMP support (for libbsc)
-- **Git** (to clone the libbsc dependency)
+Quality scores exhibit strong positional correlation (systematic 3' degradation), sequential correlation (adjacent scores are similar), and sequence-dependent effects (certain motifs produce characteristic quality profiles). Generic block-sorting captures some of this structure, but a context model that conditions directly on these features achieves better compression.
 
-## Building
+**Compressor selection.** QZ automatically selects between two quality compressors based on input characteristics:
+
+| Condition | Compressor | Rationale |
+|-----------|-----------|-----------|
+| Lossless, >= 100K reads | `quality_ctx` | Adaptive context models require sufficient data to converge; above this threshold they outperform BSC by ~7% |
+| Lossless, < 100K reads | BSC | Insufficient data for context model convergence |
+| Lossy modes | BSC | Reduced alphabet (3–7 bits) compresses efficiently under BWT without context modeling |
+
+**Context model.** `quality_ctx` is an LZMA-style forward range coder with 160,000 adaptive contexts. For each quality symbol, the context is the cross-product of:
+
+| Feature | States | Description |
+|---------|--------|-------------|
+| Position bin | 64 | `floor(pos / 5)`, captures positional quality curve |
+| Previous quality | 50 | Phred score of preceding base (0–49) |
+| Stability | 2 | `|q[i-1] - q[i-2]| <= 2` (stable) vs. changing |
+| Base pair | 25 | `prev_base * 5 + cur_base` (A/C/G/T/N x A/C/G/T/N) |
+
+Each context maintains a Laplace-smoothed frequency table over the observed quality alphabet (~20 symbols for Illumina), updated on every symbol and rescaled (halving with minimum frequency 1) when the total exceeds 2^20. The range coder uses 64-bit carry propagation and renormalizes below 2^24.
+
+On 150 bp Illumina WGS, `quality_ctx` achieves ~0.15 bits per quality score. Quality data accounts for ~6% of total archive size in lossless mode.
+
+**Parallelism.** For large inputs, quality scores are partitioned into 500K-read sub-blocks, each encoded independently and in parallel. The sub-block format is self-describing: `[num_blocks: u32][block_len: u32, blob]...`.
+
+**Lossy quantization.** Before compression, quality scores may be quantized: Illumina 8-level binning maps ~40 Phred values to 8 representatives (3 bits/symbol); discard mode replaces all scores with a constant. Quantized scores are bit-packed to the minimum width before compression.
+
+**Relation to prior work.** The context model draws on two key contributions:
+
+- *fqzcomp* (Bonfield, 2013; [paper](https://doi.org/10.1093/bioinformatics/btac010)) demonstrated that conditioning on previous quality values and a running delta counter substantially improves quality compression. fqzcomp uses an adaptive arithmetic coder with up to 16 configurable context bits and was adopted as the quality codec in CRAM 3.1. QZ integrates fqzcomp via FFI through [htscodecs](https://github.com/samtools/htscodecs) as an alternative backend.
+
+- *ENANO* (Dufort y Álvarez et al., 2020; [paper](https://doi.org/10.1093/bioinformatics/btaa551)) introduced DNA sequence context (6-base sliding window) and multi-level error confidence tracking into quality modeling, achieving strong results on nanopore data with ~32K contexts.
+
+QZ adapts both ideas for Illumina short reads: a 2-base sequence window (vs. ENANO's 6) and a binary stability flag (vs. ENANO's 4-tier confidence), yielding a larger context space (160K vs. 32K) that converges faster on the narrower Illumina quality distribution.
+
+| | fqzcomp | ENANO | QZ |
+|---|---------|-------|----|
+| Target data | General (CRAM 3.1) | Nanopore | Illumina short reads |
+| Entropy coder | Adaptive arithmetic | Range coder (Shelwien) | LZMA-style range coder |
+| Contexts | Up to 2^16 | ~32K | 160K |
+| Position | Raw or LUT-quantized | Implicit via sequence window | Binned by 5 (64 bins) |
+| Previous quality | Last 2, shifted+OR | Last 2, quantized difference | Last 1, direct (0–49) |
+| Sequence context | None | 6-base sliding window | Previous + current base (5x5) |
+| Stability/delta | Running delta counter | 4-tier error confidence | Binary stable/changing |
+| Self-describing | Yes | No | No |
+
+### Ultra mode
+
+Ultra mode (`--ultra [1-5]`) increases compression by processing 5M-record chunks, enabling BSC with LZP (Lempel-Ziv Prediction before BWT), and compressing 2 chunks in parallel. Levels trade speed and memory for ratio:
+
+| Level | RAM | Description |
+|-------|-----|-------------|
+| 1 | ~8 GB | Fast |
+| 3 | ~17 GB | High compression |
+| 5 | ~17 GB | Maximum compression |
+| auto | varies | Selects highest level fitting available RAM |
+
+## Installation
+
+### Requirements
+
+- Rust nightly (edition 2024)
+- C++ compiler with OpenMP support (for libbsc)
+
+### Build
 
 ```bash
-git clone <repo-url> qz
-cd qz
+git clone <repo-url> qz && cd qz
 git clone https://github.com/IlyaGrebnov/libbsc.git third_party/libbsc
 rustup install nightly
 rustup run nightly cargo build --release
 # Binary: target/release/qz
 ```
 
-## Usage
-
-### Default Mode
-
-The default mode gives the best balance of speed and compression. No extra flags needed.
+### Python bindings
 
 ```bash
-# Lossless compression
-qz compress -i reads.fastq -o reads.qz
+cd crates/qz-python
+pip install maturin
+maturin develop --release
+```
 
-# Gzipped input
-qz compress -i reads.fastq.gz -o reads.qz --gzipped
+## Usage
 
-# Paired-end
-qz compress -i R1.fastq -i R2.fastq -o reads.qz
+### Compress
 
-# FASTA input (no quality scores)
-qz compress -i seqs.fasta -o seqs.qz --fasta
-
-# Lossy quality binning
-qz compress -i reads.fastq -o reads.qz --quality-mode illumina-bin
-
-# Drop quality scores entirely
-qz compress -i reads.fastq -o reads.qz --quality-mode discard
-# or equivalently: --no-quality
-
-# Chunked streaming for large files (constant memory)
-qz compress -i large.fastq -o large.qz --chunked
-
-# Limit threads
-qz compress -i reads.fastq -o reads.qz -t 8
-
-# Auto-select ultra level
-qz compress -i reads.fastq -o reads.qz --ultra
-
-# Specific ultra level
-qz compress -i reads.fastq -o reads.qz --ultra 3
+```bash
+qz compress -i reads.fastq -o reads.qz                          # lossless (default)
+qz compress -i reads.fastq.gz -o reads.qz                       # gzipped input (auto-detected)
+qz compress -i reads.fastq -o reads.qz --quality-mode illumina-bin  # lossy 8-level binning
+qz compress -i reads.fastq -o reads.qz --quality-mode discard   # discard quality scores
+qz compress -i reads.fastq -o reads.qz --ultra 3                # ultra compression, level 3
+qz compress -i seqs.fasta -o seqs.qz --fasta                    # FASTA input
 ```
 
 ### Decompress
 
-Decompression auto-detects all settings from the archive — no flags needed to match what was used during compression.
+Decompression auto-detects all settings from the archive header.
 
 ```bash
 qz decompress -i reads.qz -o reads.fastq
-
-# Gzipped output
-qz decompress -i reads.qz -o reads.fastq.gz --gzipped --gzip-level 6
-
-# Paired-end
-qz decompress -i reads.qz -o R1.fastq -o R2.fastq
+qz decompress -i reads.qz -o reads.fastq.gz --gzipped           # gzipped output
 ```
 
-## Compress Options Reference
+### CLI reference
 
-### Input / Output
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-i, --input FILE` | Input FASTQ file(s). One for single-end, two for paired-end. | required |
-| `-o, --output FILE` | Output QZ archive. | required |
-| `-w, --working-dir PATH` | Working directory for temp files. | `.` |
-| `-t, --threads N` | Number of threads (0 = auto-detect). | auto |
-| `--gzipped` | Input is gzipped FASTQ. | off |
-| `--fasta` | Input is FASTA format (no quality scores). | off |
-
-### Quality
+**Compress:**
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--quality-mode MODE` | Quality compression mode (see table below). | `lossless` |
-| `--no-quality` | Discard quality scores. | off |
-| `--quality-compressor COMP` | Quality compressor: `bsc`, `zstd`, `openzl`, `fqzcomp`, `quality-ctx`. | `bsc` |
-| `--quality-delta` | Delta encoding between adjacent reads (experimental). | off |
-| `--quality-modeling` | Positional quality modeling (experimental). | off |
+| `-i, --input FILE` | Input FASTQ file (gzipped auto-detected) | required |
+| `-o, --output FILE` | Output QZ archive | required |
+| `-w, --working-dir PATH` | Working directory for temp files | `.` |
+| `-t, --threads N` | Thread count (0 = auto) | auto |
+| `--fasta` | Input is FASTA format | off |
+| `-q, --quality-mode MODE` | `lossless`, `illumina-bin`, or `discard` | `lossless` |
+| `--no-quality` | Equivalent to `--quality-mode discard` | off |
+| `--ultra [LEVEL]` | Ultra compression (1–5, or omit for auto) | off |
 
-### Sequences
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--sequence-compressor COMP` | Sequence compressor: `bsc`, `zstd`, `openzl`. | `bsc` |
-| `--twobit` | 2-bit encoding (4 bases/byte) + N-mask bitmap. | off |
-| `--rc-canon` | Reverse-complement canonicalization with strand flag. | off |
-| `--sequence-hints` | Syncmer-derived hint byte before each read for BWT clustering. | off |
-| `--sequence-delta` | Inline delta encoding against cached similar reads. | off |
-| `--delta-encoding` | Delta encoding for sequences (experimental). | off |
-| `--rle-encoding` | Run-length encoding for homopolymers (experimental). | off |
-| `--debruijn` | De Bruijn graph compression (patent-safe, RC-aware). | off |
-| `--kmer-size N` | K-mer size for de Bruijn compression (0 = auto, range 9–31). | `0` |
-
-### Headers
+**Decompress:**
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--header-compressor COMP` | Header compressor: `bsc`, `zstd`, `openzl`. | `bsc` |
-| `--header-template` | Template-based header encoding (extract prefix, delta-encode coordinates). | off |
+| `-i, --input FILE` | Input QZ archive | required |
+| `-o, --output FILE` | Output FASTQ file | required |
+| `-w, --working-dir PATH` | Working directory for temp files | `.` |
+| `-t, --threads N` | Thread count | auto |
+| `--gzipped` | Output gzipped FASTQ | off |
+| `--gzip-level N` | Gzip level (0–9) | `6` |
 
-### Compression Strategy
+### Python
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--bsc-static` | Use static QLFC instead of adaptive (~5 % larger, slightly faster). | off |
-| `--chunked` | Streaming mode: 5 M-record chunks, constant memory. | off |
-| `--ultra [LEVEL]` | Ultra compression (levels 1–5, or auto). | off |
-| `--reorder {local\|global}` | Reorder reads by similarity. `local` = within chunks; `global` = two-pass sort. Destroys original order. | off |
-| `--local-reorder` | Group similar reads by center-hash with delta encoding. Restores order on decompress. | off |
-| `--factorize` | Two-pass pattern routing for BWT clustering. | off |
-| `--arithmetic` | Arithmetic coding for sequences and qualities (experimental). | off |
+```python
+import qz
 
-## Decompress Options Reference
+qz.compress("reads.fastq", "reads.qz")
+qz.compress("reads.fastq", "reads.qz", ultra=3)
+qz.compress("reads.fastq", "reads.qz", quality_mode="illumina-bin")
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-i, --input FILE` | Input QZ archive. | required |
-| `-o, --output FILE` | Output FASTQ file(s). | required |
-| `-w, --working-dir PATH` | Working directory for temp files. | `.` |
-| `-t, --num-threads N` | Number of threads. | auto |
-| `--gzipped` | Output gzipped FASTQ. | off |
-| `--gzip-level N` | Gzip compression level (0–9). | `6` |
+qz.decompress("reads.qz", "reads.fastq")
+qz.decompress("reads.qz", "reads.fastq.gz", gzipped=True)
 
-## Quality Modes
-
-| Mode | Flag | Description |
-|------|------|-------------|
-| Lossless | `--quality-mode lossless` | Bit-exact preservation (default) |
-| Illumina 8-level | `--quality-mode illumina-bin` | Bins to 8 representative values |
-| Illumina 4-level | `--quality-mode illumina4` | 4-level binning |
-| Binary | `--quality-mode binary` | Threshold at Q20 |
-| QVZ | `--quality-mode qvz` | QVZ-style quantization |
-| Discard | `--quality-mode discard` | Drop all quality scores |
-
-## Quality Score Compression
-
-Quality scores are the most compressible stream in a FASTQ file, but also the most nuanced. A raw Phred score is a small integer (typically 0–41 for Illumina), and adjacent scores within a read are highly correlated — quality tends to degrade toward the 3' end, with occasional dips at specific positions. Across reads, the same positions tend to produce similar quality profiles. A generic compressor like BSC captures some of this structure through the BWT, but it has no awareness that position 50 of one read is related to position 50 of another, or that a quality of 37 following a 38 is far more likely than a quality of 5 following a 38.
-
-The idea of exploiting this structure with explicit context modeling was pioneered by **James Bonfield**'s [fqzcomp](https://github.com/jkbonfield/fqzcomp) and later refined by **Guillermo Dufort y Álvarez** et al. in [ENANO](https://github.com/guilledufort/EnanoFASTQ). QZ's quality compressor builds on the insights from both, while making different trade-offs suited to short-read Illumina data.
-
-### fqzcomp
-
-[fqzcomp](https://github.com/jkbonfield/fqzcomp) (Bonfield, 2013) was one of the first compressors to show that quality scores could be compressed far more effectively by conditioning on context rather than treating them as raw bytes. It uses an adaptive arithmetic coder with up to 16 bits of context assembled from four configurable sources:
-
-- **Previous quality values** — the last two quality scores, shifted and bitwise-ORed together, optionally remapped through a lookup table
-- **Position along the read** — the base offset from the 5' end, optionally quantized via a position lookup table
-- **Running delta** — a counter that increments each time a quality value differs from the previous one, capturing whether the signal is smooth or volatile. As Bonfield observed, this running variance has better discriminative power than raw position for predicting quality behavior
-- **Selector bits** — arbitrary bits copied from the data stream into the context for further discretization
-
-The context construction is written into the compressed stream itself, allowing the decoder to reconstruct it without external parameters. fqzcomp offers multiple compression strategies (fast to high) and was incorporated into the [CRAM 3.1](https://doi.org/10.1093/bioinformatics/btac010) file format as its quality codec. QZ integrates fqzcomp via FFI through the [htscodecs](https://github.com/samtools/htscodecs) library as an alternative quality backend (`--quality-compressor fqzcomp`).
-
-### ENANO
-
-[ENANO](https://doi.org/10.1093/bioinformatics/btaa551) (Dufort y Álvarez et al., 2020) was designed for nanopore FASTQ files, where the quality alphabet is much larger (94 Phred values vs. ~40 for Illumina) and the scores are noisier. ENANO's key contribution was a richer context model for quality scores that combines:
-
-- **DNA sequence neighborhood** — a sliding window of recent base calls (default length 6), encoded as a rolling hash. This captures the fact that certain sequence motifs produce systematically different quality profiles on nanopore
-- **Previous quality values** — the last two Phred scores, quantized and combined into a difference context that encodes both magnitude and direction of change
-- **Running prediction error** — per-context running averages of quality scores, with the error between predicted and actual quality fed back to classify contexts by confidence level. This creates a form of adaptive stability tracking: contexts where the model predicts well use different coding tables from contexts where quality is volatile
-- **Error magnitude averaging** — accumulated error magnitudes are binned into confidence levels (4 tiers), giving the model a second-order measure of local predictability
-
-These components combine into ~32,768 distinct contexts, each driving its own adaptive arithmetic coder (based on Eugene Shelwien's range coder). ENANO achieves >24% improvement over pigz and ~6% over SPRING on nanopore data.
-
-### QZ's approach (`quality-ctx`)
-
-QZ's quality compressor is a custom LZMA-style forward range coder that draws from both fqzcomp and ENANO but is tuned for fixed-length Illumina short reads. For each quality score, the context is a combination of:
-
-- **Read position** (binned by 5) — captures the characteristic quality curve along the read, similar to fqzcomp's position context but with coarser binning to limit context space
-- **Previous quality score** (0–49 Phred) — direct conditioning on the last quality value, as in both fqzcomp and ENANO
-- **Stability flag** — a single bit indicating whether quality is stable (|q[i-1] − q[i-2]| ≤ 2) or changing. This is a simplified version of ENANO's multi-level error confidence, reduced to a binary signal that works well for the narrower Illumina quality range
-- **DNA base context** — the cross-product of the previous and current sequence base (5 × 5 = 25 states, including N). Like ENANO's sequence neighborhood but limited to a 2-base window, reflecting that Illumina quality artifacts are more localized than nanopore's
-
-This gives ~160,000 distinct contexts (64 position bins × 50 quality levels × 2 stability states × 25 base pairs), each with its own Laplace-smoothed adaptive frequency table that updates on every symbol. On typical Illumina WGS data, this achieves ~0.15 bits per base — about 7% smaller than BSC on the same data. The compressor is enabled automatically in default mode for datasets with fixed-length reads and at least 100,000 records.
-
-### How the three approaches differ
-
-| | fqzcomp | ENANO | QZ (`quality-ctx`) |
-|---|---------|-------|--------------------|
-| **Target data** | General (CRAM 3.1) | Nanopore | Illumina short reads |
-| **Entropy coder** | Adaptive arithmetic | Range coder (Shelwien) | LZMA-style range coder |
-| **Context bits** | Up to 16 (configurable) | ~15 (32K contexts) | ~18 (160K contexts) |
-| **Position** | Raw or LUT-quantized | Implicit via sequence window | Binned by 5 (64 bins) |
-| **Previous quality** | Last 2, shifted+OR'd | Last 2, quantized difference | Last 1, direct (0–49) |
-| **Sequence context** | None | Sliding window (6 bases) | Previous + current base (5×5) |
-| **Stability/delta** | Running delta counter | Multi-level error confidence | Binary stable/changing flag |
-| **Prediction** | None | Per-context running average | None |
-| **Read length** | Variable | Variable | Fixed only |
-| **Self-describing** | Yes (context spec in stream) | No | No |
-
-The main insight QZ borrows from fqzcomp is the idea that conditioning on quality context (not just position) is essential. From ENANO, QZ takes the stability/delta concept and the use of DNA sequence as a quality predictor. Where QZ simplifies relative to both is in using fewer context levels (binary stability instead of 4-tier, 2-base window instead of 6) — this works because Illumina quality profiles are more regular than nanopore, and the narrower context space converges faster on smaller datasets.
-
-### Lossy quality modes
-
-When lossless quality preservation is not required, QZ can bin quality scores before compression, dramatically reducing the alphabet size and improving ratios across all backends. Illumina 8-level binning maps the full Phred range to 8 representative values that preserve variant calling accuracy, while more aggressive modes (4-level, binary, discard) trade quality fidelity for size.
-
-## Architecture
-
-```
-FASTQ input
-    ├─ Headers   → BSC (BWT + LZP + adaptive QLFC)
-    ├─ Sequences → BSC (BWT + LZP + adaptive QLFC)
-    └─ Qualities → BSC (BWT + LZP + adaptive QLFC)
-         ↓
-    QZ archive (single file with metadata + block offsets)
+print(qz.version())
 ```
 
-Each stream is split into **25 MB blocks** that are compressed independently and in parallel. The archive stores block offsets, record count, read lengths, and quality metadata for self-contained decompression.
+### Library (Rust)
 
-### Chunked Streaming
+```rust
+use qz_lib::cli::{CompressConfig, QualityMode};
+use qz_lib::compression;
 
-For files that exceed available memory, `--chunked` mode reads in 5 M-record chunks and pipelines I/O with compression. Temporary files keep memory constant regardless of input size — peak usage is ~6 GB for 100 M reads on 72 threads.
+let config = CompressConfig {
+    input: vec!["reads.fastq".into()],
+    output: "reads.qz".into(),
+    quality_mode: QualityMode::Lossless,
+    ..CompressConfig::default()
+};
+compression::compress(&config)?;
+```
 
-## Benchmarks
+## Project Structure
 
-10 million reads, 150 bp whole-genome sequencing (ERR3239334), 3,491 MB input. All tools verified byte-identical roundtrip. 72-core machine, sequential runs (no concurrent load).
-
-| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
-|------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 446 | **7.83x** | 17.4 s | 5.5 GB | 14.8 s | 7.2 GB |
-| **QZ ultra 3** | 416 | **8.40x** | 37.0 s | 16.1 GB | 22.0 s | 8.5 GB |
-| SPRING (no reorder) | 431 | 8.10x | 1:02.5 | 12.1 GB | 17.9 s | 10.0 GB |
-| bzip2 -9 | 542 | 6.44x | 2:49.6 | 7.3 MB | 1:30.6 | 4.5 MB |
-| pigz -9 | 695 | 5.02x | 9.7 s | 21.9 MB | 8.0 s | 1.7 MB |
-
-- **QZ default**: pipelined chunked mode (2.5M reads/chunk), BSC adaptive without LZP
-- **QZ ultra 3**: 5M reads/chunk (2 parallel), BSC adaptive with LZP, OpenMP BWT
-- **SPRING**: local reorder only (`--no-ids`), SPRING reorders reads internally so roundtrip is verified by decompression only
-
-## Environment Variables
-
-| Variable | Effect |
-|----------|--------|
-| `QZ_NO_BANNER=1` | Suppress the version banner on stderr |
-| `RUST_LOG=debug` | Enable debug logging via tracing |
+```
+qz/
+├── Cargo.toml                     workspace root
+├── third_party/libbsc/            libbsc (BWT + QLFC engine)
+├── crates/
+│   ├── qz-lib/                    core library (all algorithms, no CLI deps)
+│   │   ├── src/compression/       BSC, ultra, quality_ctx, fqzcomp, etc.
+│   │   ├── src/io/fastq.rs        FASTQ reader/writer
+│   │   ├── build.rs               compiles libbsc via cc
+│   │   └── tests/                 30 roundtrip integration tests
+│   ├── qz-cli/                    CLI binary (Clap)
+│   ├── qz-python/                 Python bindings (PyO3/maturin)
+│   └── qz-bench/                  development benchmark binaries
+├── benchmarks/                    benchmark scripts and results
+└── real_data/                     test data (not tracked)
+```
 
 ## Testing
 
@@ -288,14 +226,23 @@ For files that exceed available memory, `--chunked` mode reads in 5 M-record chu
 rustup run nightly cargo test --release
 ```
 
-Integration tests perform full compress-decompress roundtrips across quality modes, compressor combinations, chunked mode, paired-end, and more.
+30 roundtrip integration tests covering lossless, lossy quality modes, ultra mode, FASTA, and various compressor combinations.
+
+## Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `QZ_NO_BANNER=1` | Suppress version banner on stderr |
+| `RUST_LOG=debug` | Enable debug logging (tracing) |
 
 ## Acknowledgments
 
-- [libbsc](https://github.com/IlyaGrebnov/libbsc) by Ilya Grebnov — block-sorting compression library (Apache 2.0)
-- [libsais](https://github.com/IlyaGrebnov/libsais) by Ilya Grebnov — suffix array construction used by libbsc's BWT (Apache 2.0)
-- [fqzcomp](https://github.com/jkbonfield/fqzcomp) by James Bonfield — quality score context modeling, integrated via [htscodecs](https://github.com/samtools/htscodecs) (BSD)
-- [ENANO](https://github.com/guilledufort/EnanoFASTQ) by Guillermo Dufort y Álvarez et al. — delta-stability context and sequence-aware quality modeling ([paper](https://doi.org/10.1093/bioinformatics/btaa551))
+- [libbsc](https://github.com/IlyaGrebnov/libbsc) by Ilya Grebnov — block-sorting compression (BWT + LZP + QLFC). Apache 2.0.
+- [libsais](https://github.com/IlyaGrebnov/libsais) by Ilya Grebnov — suffix array construction used by libbsc's BWT. Apache 2.0.
+- [fqzcomp](https://github.com/jkbonfield/fqzcomp) by James Bonfield — context-modeled quality compression; quality codec in CRAM 3.1. Integrated via [htscodecs](https://github.com/samtools/htscodecs). BSD.
+  - Bonfield, J.K. and Mahoney, M.V. (2013). Compression of FASTQ and SAM format sequencing data. *PLoS ONE*, 8(3):e59190.
+- [ENANO](https://github.com/guilledufort/EnanoFASTQ) by Guillermo Dufort y Álvarez et al. — sequence-aware quality modeling with stability tracking.
+  - Dufort y Álvarez, G. et al. (2020). ENANO: encoder for nanopore FASTQ files. *Bioinformatics*, 36(16):4506–4507.
 
 ## License
 

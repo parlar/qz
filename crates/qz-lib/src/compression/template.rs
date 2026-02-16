@@ -124,10 +124,6 @@ impl TemplateGraph {
                  min_count, before, self.kmers.len());
     }
 
-    fn contains(&self, canon_hash: u64) -> bool {
-        self.kmers.contains_key(&canon_hash)
-    }
-
     fn hash_to_sequence(hash: u64, k: usize) -> Vec<u8> {
         let mut seq = vec![0u8; k];
         let mut h = hash;
@@ -138,55 +134,6 @@ impl TemplateGraph {
         seq
     }
 
-    fn successors(&self, kmer_seq: &[u8]) -> Vec<(u64, u8, u16)> {
-        let k = self.k;
-        let suffix = &kmer_seq[1..];
-        let mut result = Vec::new();
-        for &base in &[b'A', b'C', b'G', b'T'] {
-            let mut candidate = Vec::with_capacity(k);
-            candidate.extend_from_slice(suffix);
-            candidate.push(base);
-            if let Some(canon) = canonical_hash(&candidate, k) {
-                if let Some(&count) = self.kmers.get(&canon) {
-                    result.push((canon, base, count));
-                }
-            }
-        }
-        result
-    }
-
-    fn predecessors(&self, kmer_seq: &[u8]) -> Vec<(u64, u8, u16)> {
-        let k = self.k;
-        let prefix = &kmer_seq[..k - 1];
-        let mut result = Vec::new();
-        for &base in &[b'A', b'C', b'G', b'T'] {
-            let mut candidate = Vec::with_capacity(k);
-            candidate.push(base);
-            candidate.extend_from_slice(prefix);
-            if let Some(canon) = canonical_hash(&candidate, k) {
-                if let Some(&count) = self.kmers.get(&canon) {
-                    result.push((canon, base, count));
-                }
-            }
-        }
-        result
-    }
-
-    /// Get the highest-coverage successor (greedy walk)
-    fn best_successor(&self, kmer_seq: &[u8]) -> Option<(u64, u8)> {
-        self.successors(kmer_seq)
-            .into_iter()
-            .max_by_key(|&(_, _, count)| count)
-            .map(|(hash, base, _)| (hash, base))
-    }
-
-    /// Get the highest-coverage predecessor (greedy walk)
-    fn best_predecessor(&self, kmer_seq: &[u8]) -> Option<(u64, u8)> {
-        self.predecessors(kmer_seq)
-            .into_iter()
-            .max_by_key(|&(_, _, count)| count)
-            .map(|(hash, base, _)| (hash, base))
-    }
 }
 
 // ── Template (greedy walk) extraction ───────────────────────────────────────

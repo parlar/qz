@@ -46,11 +46,11 @@ fn main() {
     {
         let raw_bytes: Vec<u8> = sequences.iter().flat_map(|s| s.as_bytes()).copied().collect();
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&raw_bytes).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&raw_bytes).unwrap();
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let _decompressed = qz::compression::bsc::decompress_parallel(&compressed).unwrap();
+        let _decompressed = qz_lib::compression::bsc::decompress_parallel(&compressed).unwrap();
         let decomp_time = t2.elapsed();
 
         let ratio = total_bases as f64 / compressed.len() as f64;
@@ -68,13 +68,13 @@ fn main() {
     {
         let t = Instant::now();
         let compressed =
-            qz::compression::greedy_contig::compress_sequences_greedy(&sequences).unwrap();
+            qz_lib::compression::greedy_contig::compress_sequences_greedy(&sequences).unwrap();
         let comp_time = t.elapsed();
 
         // Decompress uses same DBG1 format as de Bruijn
         let t2 = Instant::now();
         let decompressed =
-            qz::compression::debruijn::decompress_sequences_debruijn(&compressed, num_reads)
+            qz_lib::compression::debruijn::decompress_sequences_debruijn(&compressed, num_reads)
                 .unwrap();
         let decomp_time = t2.elapsed();
 

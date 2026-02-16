@@ -63,7 +63,7 @@ fn try_compress(
     match result {
         Ok(compressed) => {
             let t2 = Instant::now();
-            match qz::compression::openzl::decompress(&compressed) {
+            match qz_lib::compression::openzl::decompress(&compressed) {
                 Ok(decompressed) => {
                     let roundtrip = t2.elapsed();
                     assert_eq!(data, decompressed.as_slice(), "{} roundtrip mismatch", name);
@@ -96,12 +96,12 @@ fn benchmark_stream(label: &str, data: &[u8]) {
     // 1. BSC adaptive (baseline)
     {
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(data)
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(data)
             .expect("BSC compress failed");
         let comp_time = t.elapsed();
 
         let t2 = Instant::now();
-        let decompressed = qz::compression::bsc::decompress_parallel(&compressed)
+        let decompressed = qz_lib::compression::bsc::decompress_parallel(&compressed)
             .expect("BSC decompress failed");
         let roundtrip = t2.elapsed();
 
@@ -111,47 +111,47 @@ fn benchmark_stream(label: &str, data: &[u8]) {
 
     // 2. OpenZL generic (default = compress_generic internally)
     try_compress("OpenZL generic", data, |d| {
-        qz::compression::openzl::compress(d)
+        qz_lib::compression::openzl::compress(d)
     });
 
     // 3. OpenZL ACE (Adaptive Codec Engine)
     try_compress("OpenZL ACE", data, |d| {
-        qz::compression::openzl::compress_ace(d)
+        qz_lib::compression::openzl::compress_ace(d)
     });
 
     // 4. OpenZL DNA numeric (serial -> u8 numeric + entropy)
     try_compress("OpenZL DNA numeric", data, |d| {
-        qz::compression::openzl::compress_dna_numeric(d)
+        qz_lib::compression::openzl::compress_dna_numeric(d)
     });
 
     // 5. OpenZL delta + entropy (serial -> u8 -> delta -> entropy)
     try_compress("OpenZL delta+entropy", data, |d| {
-        qz::compression::openzl::compress_delta_entropy(d)
+        qz_lib::compression::openzl::compress_delta_entropy(d)
     });
 
     // 6. OpenZL FSE (Finite State Entropy)
     try_compress("OpenZL FSE", data, |d| {
-        qz::compression::openzl::compress_fse(d)
+        qz_lib::compression::openzl::compress_fse(d)
     });
 
     // 7. OpenZL Huffman
     try_compress("OpenZL Huffman", data, |d| {
-        qz::compression::openzl::compress_huffman(d)
+        qz_lib::compression::openzl::compress_huffman(d)
     });
 
     // 8. OpenZL transpose + zstd
     try_compress("OpenZL transpose+zstd", data, |d| {
-        qz::compression::openzl::compress_transpose_zstd(d)
+        qz_lib::compression::openzl::compress_transpose_zstd(d)
     });
 
     // 9. OpenZL field LZ
     try_compress("OpenZL field_lz", data, |d| {
-        qz::compression::openzl::compress_field_lz(d)
+        qz_lib::compression::openzl::compress_field_lz(d)
     });
 
     // 10. OpenZL clustering
     try_compress("OpenZL clustering", data, |d| {
-        qz::compression::openzl::compress_clustering(d)
+        qz_lib::compression::openzl::compress_clustering(d)
     });
 }
 

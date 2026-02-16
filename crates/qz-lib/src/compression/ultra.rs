@@ -516,17 +516,6 @@ const SEQ_ARITH_RESCALE: u32 = 1 << 15;
 const ARITH_MARKER: u8 = 0xFE;
 
 #[inline]
-fn base_to_seq_code(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => 4,
-    }
-}
-
-#[inline]
 fn seq_code_to_base(c: u8) -> u8 {
     match c { 0 => b'A', 1 => b'C', 2 => b'G', 3 => b'T', _ => b'N' }
 }
@@ -534,57 +523,6 @@ fn seq_code_to_base(c: u8) -> u8 {
 // ── Range coder (LZMA-style, from quality_ctx.rs pattern) ────────────────
 
 const SEQ_RC_TOP: u32 = 1 << 24;
-
-struct SeqRangeEncoder {
-    low: u64,
-    range: u32,
-    cache: u8,
-    cache_size: u32,
-    output: Vec<u8>,
-}
-
-impl SeqRangeEncoder {
-    fn new() -> Self {
-        Self { low: 0, range: 0xFFFF_FFFF, cache: 0, cache_size: 1, output: Vec::new() }
-    }
-
-    #[inline(always)]
-    fn shift_low(&mut self) {
-        let low_hi = (self.low >> 32) as u8;
-        if low_hi != 0 || (self.low as u32) < 0xFF00_0000 {
-            let mut byte = self.cache;
-            loop {
-                self.output.push(byte.wrapping_add(low_hi));
-                byte = 0xFF;
-                self.cache_size -= 1;
-                if self.cache_size == 0 { break; }
-            }
-            self.cache = ((self.low >> 24) & 0xFF) as u8;
-        }
-        self.cache_size += 1;
-        self.low = ((self.low as u32) << 8) as u64;
-    }
-
-    #[inline(always)]
-    fn encode(&mut self, cum: u32, freq: u32, total: u32) {
-        let r = self.range / total;
-        self.low += cum as u64 * r as u64;
-        if cum + freq < total {
-            self.range = r * freq;
-        } else {
-            self.range -= r * cum;
-        }
-        while self.range < SEQ_RC_TOP {
-            self.range <<= 8;
-            self.shift_low();
-        }
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        for _ in 0..5 { self.shift_low(); }
-        self.output
-    }
-}
 
 struct SeqRangeDecoder<'a> {
     range: u32,
@@ -647,13 +585,6 @@ impl SeqModel {
     }
 
     #[inline(always)]
-    fn encode_params(&self, sym: usize) -> (u32, u32, u32) {
-        let cum = self.cum_freqs[sym];
-        let freq = self.cum_freqs[sym + 1] - cum;
-        (cum, freq, self.total)
-    }
-
-    #[inline(always)]
     fn update(&mut self, sym: usize) {
         for i in (sym + 1)..=SEQ_N_SYMBOLS {
             self.cum_freqs[i] += 1;
@@ -675,40 +606,6 @@ impl SeqModel {
         }
         self.total = cum;
     }
-}
-
-/// Arithmetic-encode reordered sequences using per-column order-1 context.
-fn encode_sequences_arith(
-    records: &[crate::io::FastqRecord],
-    order: &[u32],
-) -> Vec<u8> {
-    let max_len = order.iter()
-        .map(|&i| records[i as usize].sequence.len())
-        .max().unwrap_or(0);
-    let max_pos = max_len.min(SEQ_MAX_POS);
-    let num_contexts = max_pos * SEQ_N_PREV;
-
-    let mut prev_col = vec![5u8; max_len]; // START sentinel
-    let mut models: Vec<SeqModel> = (0..num_contexts).map(|_| SeqModel::new()).collect();
-    let mut encoder = SeqRangeEncoder::new();
-
-    for &idx in order {
-        let seq = records[idx as usize].sequence.as_bytes();
-        for j in 0..seq.len() {
-            let base = base_to_seq_code(seq[j]) as usize;
-            let pos = j.min(max_pos - 1);
-            let prev = prev_col[j] as usize;
-            let ctx_idx = pos * SEQ_N_PREV + prev;
-
-            let (cum, freq, total) = models[ctx_idx].encode_params(base);
-            encoder.encode(cum, freq, total);
-            models[ctx_idx].update(base);
-
-            prev_col[j] = base as u8;
-        }
-    }
-
-    encoder.finish()
 }
 
 /// Decode arithmetic-coded sequences.
@@ -750,21 +647,6 @@ fn decode_sequences_arith(
     }
 
     Ok(sequences)
-}
-
-/// BSC-compress data and serialize as [num_blocks: u32, [block_len: u32, data]* ]
-fn bsc_compress_to_blob(data: &[u8], compress_fn: fn(&[u8]) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
-    if data.is_empty() {
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&0u32.to_le_bytes());
-        return Ok(blob);
-    }
-    let compressed = compress_fn(data)?;
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&1u32.to_le_bytes());
-    blob.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&compressed);
-    Ok(blob)
 }
 
 /// Decompress BSC blocks from blob format [num_blocks: u32, [block_len: u32, data]* ]
@@ -945,7 +827,7 @@ fn compress_chunk(
     };
 
     // Build seq_data based on mode
-    let seq_data = match mode {
+    match mode {
         HarcMode::ReorderLocal => {
             let mut seq_stream = Vec::with_capacity(n * 150);
             for &idx in &reorder.order {
@@ -1084,18 +966,16 @@ fn compress_chunk(
                 num_reads: n,
             });
         }
-    };
-
-    unreachable!()
+    }
 }
 
 // ── Public API: compress ─────────────────────────────────────────────────
 
-fn compress_inner(args: &CompressArgs, mode: HarcMode) -> Result<()> {
+fn compress_inner(args: &CompressConfig, mode: HarcMode) -> Result<()> {
     compress_inner_with(args, mode, CHUNK_SIZE, 2, 500_000)
 }
 
-fn compress_inner_with(args: &CompressArgs, mode: HarcMode, chunk_size: usize, max_parallel_chunks: usize, quality_sub_block: usize) -> Result<()> {
+fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize, max_parallel_chunks: usize, quality_sub_block: usize) -> Result<()> {
     use std::io::{Write, BufWriter};
     use crate::cli::QualityCompressor;
 
@@ -1115,12 +995,6 @@ fn compress_inner_with(args: &CompressArgs, mode: HarcMode, chunk_size: usize, m
         && quality_mode == QualityMode::Lossless
         && (args.quality_compressor == QualityCompressor::QualityCtx
             || true); // always auto-select for harc path (chunks are 5M reads >> 100K threshold)
-    let quality_compressor_used = if use_quality_ctx {
-        QualityCompressor::QualityCtx
-    } else {
-        QualityCompressor::Bsc
-    };
-
     if use_quality_ctx {
         info!("Using context-adaptive quality compression (quality_ctx)");
     }
@@ -1278,7 +1152,6 @@ fn compress_inner_with(args: &CompressArgs, mode: HarcMode, chunk_size: usize, m
     info!("Writing output file...");
     let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
 
-    use std::io::Write as _;
     out.write_all(&[mode.encoding_type()])?;
     out.write_all(&[0u8])?; // arithmetic_mode
     out.write_all(&[binning_to_code(quality_binning)])?;
@@ -1329,15 +1202,11 @@ fn compress_inner_with(args: &CompressArgs, mode: HarcMode, chunk_size: usize, m
     Ok(())
 }
 
-pub(super) fn compress_harc(args: &CompressArgs) -> Result<()> {
+pub(super) fn compress_harc(args: &CompressConfig) -> Result<()> {
     compress_inner(args, HarcMode::Delta)
 }
 
-pub(super) fn compress_reorder_local(args: &CompressArgs) -> Result<()> {
-    compress_inner(args, HarcMode::ReorderLocal)
-}
-
-pub(super) fn compress_reorder_local_with_level(args: &CompressArgs, level: UltraLevel) -> Result<()> {
+pub(super) fn compress_reorder_local_with_level(args: &CompressConfig, level: UltraLevel) -> Result<()> {
     info!("Ultra level {}: chunk_size={}M, parallel_chunks={}, quality_sub_block={}K",
         level.level, level.chunk_size / 1_000_000, level.max_parallel_chunks, level.quality_sub_block / 1000);
     compress_inner_with(args, HarcMode::ReorderLocal, level.chunk_size, level.max_parallel_chunks, level.quality_sub_block)

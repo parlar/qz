@@ -4,12 +4,9 @@
 use std::env;
 use std::time::Instant;
 
-// Include the module directly to avoid touching mod.rs
-#[path = "../compression/quality_ctx.rs"]
-mod quality_ctx;
-
-use qz::compression::bsc;
-use qz::io::fastq::FastqReader;
+use qz_lib::compression::quality_ctx;
+use qz_lib::compression::bsc;
+use qz_lib::io::fastq::FastqReader;
 
 fn main() {
     let args: Vec<String> = env::args().collect();

@@ -7,10 +7,10 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use qz::compression::bsc;
-use qz::compression::dna_utils::{kmer_to_hash, reverse_complement_hash};
-use qz::compression::fqzcomp;
-use qz::compression::quality_context::{self, QualityContextConfig};
+use qz_lib::compression::bsc;
+use qz_lib::compression::dna_utils::{kmer_to_hash, reverse_complement_hash};
+use qz_lib::compression::fqzcomp;
+use qz_lib::compression::quality_context::{self, QualityContextConfig};
 use rayon::prelude::*;
 
 fn main() {
@@ -481,7 +481,7 @@ fn main() {
             let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
             (sum / bytes.len().max(1) as u64) as u8
         }).collect();
-        let mean_bsc = bsc::compress_parallel_adaptive(&mean_quals).unwrap();
+        let _mean_bsc = bsc::compress_parallel_adaptive(&mean_quals).unwrap();
 
         // Delta perm cost
         let mut perm_delta: Vec<u8> = Vec::with_capacity(num_reads * 3);

@@ -4,7 +4,7 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use qz::compression::template::{
+use qz_lib::compression::template::{
     compress_sequences_template_hybrid,
     TemplateParams,
 };
@@ -55,7 +55,7 @@ fn main() {
             .copied()
             .collect();
         let t = Instant::now();
-        let compressed = qz::compression::bsc::compress_parallel_adaptive(&raw_bytes).unwrap();
+        let compressed = qz_lib::compression::bsc::compress_parallel_adaptive(&raw_bytes).unwrap();
         let elapsed = t.elapsed();
         let ratio = total_bases as f64 / compressed.len() as f64;
         println!(

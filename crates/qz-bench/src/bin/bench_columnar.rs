@@ -23,7 +23,7 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use qz::compression::bsc;
+use qz_lib::compression::bsc;
 use rayon::prelude::*;
 
 // ── Base encoding ────────────────────────────────────────────────────────

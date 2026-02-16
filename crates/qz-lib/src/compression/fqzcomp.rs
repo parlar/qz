@@ -3,7 +3,7 @@
 /// fqzcomp uses an adaptive arithmetic coder with a rich context model
 /// (position, previous quality, cumulative delta) to compress quality scores.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 // FFI declarations matching fqzcomp_qual.h
 #[repr(C)]
@@ -48,7 +48,7 @@ pub fn compress(qualities: &[&str], strat: i32) -> Result<Vec<u8>> {
     let total_bytes: usize = qualities.iter().map(|q| q.len()).sum();
     let mut concat = Vec::with_capacity(total_bytes);
     let mut lengths: Vec<u32> = Vec::with_capacity(qualities.len());
-    let mut flags: Vec<u32> = vec![0; qualities.len()]; // No flags needed
+    let flags: Vec<u32> = vec![0; qualities.len()]; // No flags needed
 
     for q in qualities {
         concat.extend_from_slice(q.as_bytes());

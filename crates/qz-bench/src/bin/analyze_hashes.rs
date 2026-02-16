@@ -1,8 +1,8 @@
 /// Quick analysis of syncmer hash frequency distribution in FASTQ data
 use std::collections::HashMap;
 use std::env;
-use qz::io::fastq::FastqReader;
-use qz::compression::dna_utils::compute_min_syncmer_hash;
+use qz_lib::io::fastq::FastqReader;
+use qz_lib::compression::dna_utils::compute_min_syncmer_hash;
 
 fn main() {
     let args: Vec<String> = env::args().collect();

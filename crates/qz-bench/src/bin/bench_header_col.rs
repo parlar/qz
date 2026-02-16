@@ -8,12 +8,10 @@
 use std::env;
 use std::time::Instant;
 
-use qz::compression::bsc;
-use qz::io::fastq::FastqReader;
+use qz_lib::compression::bsc;
+use qz_lib::io::fastq::FastqReader;
 
-// Include the module directly to avoid touching mod.rs
-#[path = "../compression/header_col.rs"]
-mod header_col;
+use qz_lib::compression::header_col;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
