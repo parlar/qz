@@ -16,13 +16,13 @@ All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) an
 
 | Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
 |------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 446 | **7.83x** | 20.5 s | 5.2 GB | 14.9 s | 6.9 GB |
-| **QZ ultra 3** | 416 | **8.39x** | 37.2 s | 16.1 GB | 20.7 s | 8.5 GB |
-| SPRING | 431 | 8.10x | 66.1 s | 12.0 GB | 16.5 s | 10.0 GB |
-| bzip2 -9 | 542 | 6.44x | 178.6 s | 7.3 MB | 90.7 s | 4.5 MB |
-| pigz -9 | 695 | 5.02x | 10.1 s | 23.1 MB | 8.0 s | 1.7 MB |
+| **QZ default** | 435 | **8.03x** | 17.6 s | 5.9 GB | 14.7 s | 6.7 GB |
+| **QZ ultra 3** | 416 | **8.39x** | 34.2 s | 13.8 GB | 21.3 s | 8.5 GB |
+| SPRING | 431 | 8.10x | 65.2 s | 9.9 GB | 16.9 s | 10.0 GB |
+| bzip2 -9 | 542 | 6.44x | 168.5 s | 7.3 MB | 88.2 s | 4.5 MB |
+| pigz -9 | 695 | 5.02x | 10.0 s | 22.5 MB | 8.0 s | 1.7 MB |
 
-SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results.txt`](benchmarks/results.txt).
+SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results_10m_optimized.txt`](benchmarks/results_10m_optimized.txt).
 
 ## Method
 

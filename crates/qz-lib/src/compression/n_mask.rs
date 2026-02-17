@@ -17,6 +17,23 @@ pub struct NMaskEncoding {
     pub length: usize,            // Original sequence length
 }
 
+/// Lookup table: base ASCII → 2-bit encoding (N/unknown → 0 = A).
+static NMASK_BASE_2BIT: [u8; 256] = {
+    let mut t = [0u8; 256]; // default 0 covers A, a, N, n, and unknowns
+    t[b'C' as usize] = 0b01; t[b'c' as usize] = 0b01;
+    t[b'G' as usize] = 0b10; t[b'g' as usize] = 0b10;
+    t[b'T' as usize] = 0b11; t[b't' as usize] = 0b11;
+    t
+};
+
+/// Lookup table: base ASCII → true if N/n.
+static NMASK_IS_N: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[b'N' as usize] = 1;
+    t[b'n' as usize] = 1;
+    t
+};
+
 /// Encode sequence with N-mask: 2-bit + bitmap
 pub fn encode_with_n_mask(seq: &[u8]) -> NMaskEncoding {
     let len = seq.len();
@@ -27,26 +44,37 @@ pub fn encode_with_n_mask(seq: &[u8]) -> NMaskEncoding {
     // Allocate N-mask bitmap storage (8 bases per byte)
     let mut n_mask = vec![0u8; (len + 7) / 8];
 
-    for (i, &base) in seq.iter().enumerate() {
-        // Encode base (N→A for 2-bit encoding)
-        let base_2bit = match base.to_ascii_uppercase() {
-            b'A' | b'N' => 0b00,  // N temporarily maps to A in 2-bit
-            b'C' => 0b01,
-            b'G' => 0b10,
-            b'T' => 0b11,
-            _ => 0b00,  // Unknown → A
-        };
+    // Process 4 bases at a time (one packed byte) to avoid per-base division
+    let full_chunks = len / 4;
+    for chunk_idx in 0..full_chunks {
+        let base_off = chunk_idx * 4;
+        let b0 = seq[base_off];
+        let b1 = seq[base_off + 1];
+        let b2 = seq[base_off + 2];
+        let b3 = seq[base_off + 3];
 
-        // Store in 2-bit sequence (4 bases per byte)
+        // Pack 4 bases into one byte using LUT
+        sequence_2bit[chunk_idx] = NMASK_BASE_2BIT[b0 as usize]
+            | (NMASK_BASE_2BIT[b1 as usize] << 2)
+            | (NMASK_BASE_2BIT[b2 as usize] << 4)
+            | (NMASK_BASE_2BIT[b3 as usize] << 6);
+
+        // Mark N positions in bitmap using LUT
+        if NMASK_IS_N[b0 as usize] != 0 { n_mask[base_off / 8] |= 1 << (base_off % 8); }
+        if NMASK_IS_N[b1 as usize] != 0 { n_mask[(base_off + 1) / 8] |= 1 << ((base_off + 1) % 8); }
+        if NMASK_IS_N[b2 as usize] != 0 { n_mask[(base_off + 2) / 8] |= 1 << ((base_off + 2) % 8); }
+        if NMASK_IS_N[b3 as usize] != 0 { n_mask[(base_off + 3) / 8] |= 1 << ((base_off + 3) % 8); }
+    }
+
+    // Handle remaining 0-3 bases
+    for i in (full_chunks * 4)..len {
+        let base = seq[i];
         let byte_idx = i / 4;
         let bit_offset = (i % 4) * 2;
-        sequence_2bit[byte_idx] |= base_2bit << bit_offset;
+        sequence_2bit[byte_idx] |= NMASK_BASE_2BIT[base as usize] << bit_offset;
 
-        // Mark N in bitmap (8 bases per byte)
-        if matches!(base.to_ascii_uppercase(), b'N') {
-            let mask_byte_idx = i / 8;
-            let mask_bit_offset = i % 8;
-            n_mask[mask_byte_idx] |= 1 << mask_bit_offset;
+        if NMASK_IS_N[base as usize] != 0 {
+            n_mask[i / 8] |= 1 << (i % 8);
         }
     }
 

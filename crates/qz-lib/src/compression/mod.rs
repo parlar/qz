@@ -364,7 +364,7 @@ fn sort_records_by_key(records: Vec<crate::io::FastqRecord>) -> Vec<crate::io::F
     let mut keyed: Vec<(u128, crate::io::FastqRecord)> = keys.into_iter()
         .zip(records.into_iter())
         .collect();
-    keyed.sort_unstable_by_key(|(k, _)| *k);
+    keyed.par_sort_unstable_by_key(|(k, _)| *k);
     keyed.into_iter().map(|(_, r)| r).collect()
 }
 
@@ -397,8 +397,7 @@ fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool) -> Result<Vec<Ve
         bsc::compress_adaptive_no_lzp
     };
 
-    let chunks: Vec<&[u8]> = data.chunks(BSC_BLOCK_SIZE).collect();
-    let mut blocks: Vec<Vec<u8>> = chunks.par_iter()
+    let mut blocks: Vec<Vec<u8>> = data.par_chunks(BSC_BLOCK_SIZE)
         .map(|chunk| compress_fn(chunk))
         .collect::<Result<Vec<_>>>()?;
 

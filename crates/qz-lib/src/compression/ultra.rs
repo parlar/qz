@@ -114,19 +114,21 @@ pub(super) fn resolve_ultra_level(requested: u8) -> UltraLevel {
 
 // ── Center hash ─────────────────────────────────────────────────────────
 
+/// Lookup table for base → 2-bit encoding (branchless).
+static BASE_2BIT_LUT: [u64; 256] = {
+    let mut t = [0u64; 256];
+    t[b'C' as usize] = 1; t[b'c' as usize] = 1;
+    t[b'G' as usize] = 2; t[b'g' as usize] = 2;
+    t[b'T' as usize] = 3; t[b't' as usize] = 3;
+    t
+};
+
 /// Compute a 2-bit hash of a k-mer at a fixed position in the sequence.
 #[inline]
 fn hash_kmer_at(seq: &[u8], start: usize, k: usize) -> u64 {
     let mut h: u64 = 0;
     for i in start..start + k {
-        let v = match seq[i] {
-            b'A' | b'a' => 0u64,
-            b'C' | b'c' => 1,
-            b'G' | b'g' => 2,
-            b'T' | b't' => 3,
-            _ => 0,
-        };
-        h = (h << 2) | v;
+        h = (h << 2) | BASE_2BIT_LUT[seq[i] as usize];
     }
     h
 }
@@ -484,16 +486,20 @@ fn reorder_chunk_minimizer_uf(records: &[crate::io::FastqRecord]) -> ReorderResu
 
 // ── Delta encoding helpers ──────────────────────────────────────────────
 
+/// Lookup table for base → delta code (branchless): 0=match, 1=A, 2=C, 3=G, 4=T, 5=N.
+static BASE_DELTA_LUT: [u8; 256] = {
+    let mut t = [5u8; 256];
+    t[b'A' as usize] = 1; t[b'a' as usize] = 1;
+    t[b'C' as usize] = 2; t[b'c' as usize] = 2;
+    t[b'G' as usize] = 3; t[b'g' as usize] = 3;
+    t[b'T' as usize] = 4; t[b't' as usize] = 4;
+    t
+};
+
 /// Encode base as delta code: 0=match, 1=A, 2=C, 3=G, 4=T, 5=N.
 #[inline]
 fn base_to_delta_code(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => 1,
-        b'C' | b'c' => 2,
-        b'G' | b'g' => 3,
-        b'T' | b't' => 4,
-        _ => 5,
-    }
+    BASE_DELTA_LUT[b as usize]
 }
 
 #[inline]
@@ -849,8 +855,7 @@ fn compress_chunk(
                             let compressed = bsc::compress_adaptive_mt(&data)?;
                             Ok(vec![compressed])
                         } else {
-                            let chunks: Vec<&[u8]> = data.chunks(MAX_BSC_BLOCK).collect();
-                            let blocks: Vec<Vec<u8>> = chunks.par_iter()
+                            let blocks: Vec<Vec<u8>> = data.par_chunks(MAX_BSC_BLOCK)
                                 .map(|chunk| bsc::compress_adaptive_mt(chunk))
                                 .collect::<Result<Vec<_>>>()?;
                             Ok(blocks)
@@ -903,7 +908,8 @@ fn compress_chunk(
                     }
                 }
 
-                prev_seq = cur_seq.to_vec();
+                prev_seq.clear();
+                prev_seq.extend_from_slice(cur_seq);
             }
 
             let seq_streams = vec![order_stream, delta_stream, rl_stream];
@@ -944,8 +950,7 @@ fn compress_chunk(
                                 let compressed = compress_fn(&data)?;
                                 Ok(vec![compressed])
                             } else {
-                                let chunks: Vec<&[u8]> = data.chunks(HARC_BSC_BLOCK_SIZE).collect();
-                                let mut blocks: Vec<Vec<u8>> = chunks.par_iter()
+                                let mut blocks: Vec<Vec<u8>> = data.par_chunks(HARC_BSC_BLOCK_SIZE)
                                     .map(|chunk| compress_fn(chunk))
                                     .collect::<Result<Vec<_>>>()?;
                                 for b in &mut blocks { b.shrink_to_fit(); }
@@ -1513,7 +1518,8 @@ fn decode_chunk_delta(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
             }
         }
 
-        prev_seq = seq.clone();
+        prev_seq.clear();
+        prev_seq.extend_from_slice(&seq);
         sequences.push(seq);
     }
 

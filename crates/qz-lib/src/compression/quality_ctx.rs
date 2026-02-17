@@ -232,15 +232,19 @@ fn context_id(pos: usize, prev_q: u8, prev_q2: u8, prev_base: u8, cur_base: u8) 
         + bc
 }
 
+/// Lookup table for base → index (branchless, called ~300M times).
+static BASE_TO_IDX_LUT: [u8; 256] = {
+    let mut t = [4u8; 256];
+    t[b'A' as usize] = 0; t[b'a' as usize] = 0;
+    t[b'C' as usize] = 1; t[b'c' as usize] = 1;
+    t[b'G' as usize] = 2; t[b'g' as usize] = 2;
+    t[b'T' as usize] = 3; t[b't' as usize] = 3;
+    t
+};
+
 #[inline(always)]
 fn base_to_idx(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => 4,
-    }
+    BASE_TO_IDX_LUT[b as usize]
 }
 
 // ============================================================================

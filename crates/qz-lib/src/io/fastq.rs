@@ -27,7 +27,7 @@ impl FastqRecord {
 pub struct FastqReader<R: BufRead> {
     reader: R,
     is_fasta: bool,
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 // Enum to hold either a plain file reader or gzipped reader
@@ -91,26 +91,36 @@ impl<R: BufRead> FastqReader<R> {
         Self {
             reader,
             is_fasta,
-            buffer: String::with_capacity(512), // Pre-allocate for typical read lengths
+            buffer: Vec::with_capacity(512), // Pre-allocate for typical read lengths
         }
+    }
+
+    /// Trim trailing \n and \r\n from the buffer in-place, return the trimmed length.
+    #[inline]
+    fn trim_newline(buf: &mut Vec<u8>) -> usize {
+        while buf.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
+            buf.pop();
+        }
+        buf.len()
     }
 
     /// Read the next FASTQ record
     pub fn next(&mut self) -> Result<Option<FastqRecord>> {
-        // Read ID line
+        // Read ID line (read_until avoids UTF-8 validation overhead of read_line)
         self.buffer.clear();
-        let bytes_read = self.reader.read_line(&mut self.buffer)?;
+        let bytes_read = self.reader.read_until(b'\n', &mut self.buffer)?;
         if bytes_read == 0 {
             return Ok(None); // EOF
         }
-
-        let id = self.buffer.trim_end().as_bytes().to_vec();
+        Self::trim_newline(&mut self.buffer);
+        let id = self.buffer.clone();
 
         // Read sequence line
         self.buffer.clear();
-        self.reader.read_line(&mut self.buffer)
+        self.reader.read_until(b'\n', &mut self.buffer)
             .context("Invalid FASTQ: missing sequence line")?;
-        let sequence = self.buffer.trim_end().as_bytes().to_vec();
+        Self::trim_newline(&mut self.buffer);
+        let sequence = self.buffer.clone();
 
         if self.is_fasta {
             return Ok(Some(FastqRecord::new(id, sequence, None)));
@@ -118,27 +128,28 @@ impl<R: BufRead> FastqReader<R> {
 
         // Read and validate separator line ('+')
         self.buffer.clear();
-        let sep_bytes = self.reader.read_line(&mut self.buffer)
+        let sep_bytes = self.reader.read_until(b'\n', &mut self.buffer)
             .context("Invalid FASTQ: missing '+' line")?;
         if sep_bytes == 0 {
             anyhow::bail!("Invalid FASTQ: unexpected EOF at '+' separator line");
         }
-        let separator = self.buffer.trim_end();
-        if !separator.starts_with('+') {
+        if self.buffer.first() != Some(&b'+') {
+            Self::trim_newline(&mut self.buffer);
             anyhow::bail!(
                 "Invalid FASTQ: expected '+' separator line, got {:?}",
-                separator
+                String::from_utf8_lossy(&self.buffer)
             );
         }
 
         // Read quality line
         self.buffer.clear();
-        let qual_bytes = self.reader.read_line(&mut self.buffer)
+        let qual_bytes = self.reader.read_until(b'\n', &mut self.buffer)
             .context("Invalid FASTQ: missing quality line")?;
         if qual_bytes == 0 {
             anyhow::bail!("Invalid FASTQ: unexpected EOF at quality line");
         }
-        let quality = self.buffer.trim_end().as_bytes().to_vec();
+        Self::trim_newline(&mut self.buffer);
+        let quality = self.buffer.clone();
 
         // Validate sequence and quality lengths match
         if quality.len() != sequence.len() {
