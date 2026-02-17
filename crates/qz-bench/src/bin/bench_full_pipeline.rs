@@ -202,7 +202,7 @@ fn main() {
     );
 
     // Syncmer-reordered qualities using same permutation (free perm!)
-    let syncmer_reordered_quals: Vec<&str> = seq_perm.iter().map(|&i| qualities[i as usize].as_str()).collect();
+    let syncmer_reordered_quals: Vec<&[u8]> = seq_perm.iter().map(|&i| qualities[i as usize].as_bytes()).collect();
     let t = Instant::now();
     let qual_syncmer_fqz = fqzcomp::compress(&syncmer_reordered_quals, 0).unwrap();
     let qual_syncmer_fqz_time = t.elapsed();
@@ -232,7 +232,7 @@ fn main() {
         let sum: u64 = q.iter().map(|&b| b as u64).sum();
         sum / q.len().max(1) as u64
     });
-    let reordered_quals: Vec<&str> = perm_mean.iter().map(|&i| qualities[i as usize].as_str()).collect();
+    let reordered_quals: Vec<&[u8]> = perm_mean.iter().map(|&i| qualities[i as usize].as_bytes()).collect();
     let qual_fqz = fqzcomp::compress(&reordered_quals, 0).unwrap();
     // Store mean-quality sort key (1 byte per read)
     let mean_quals: Vec<u8> = qualities.iter().map(|q| {

@@ -16,8 +16,8 @@ const ILLUMINA_BINS: [u8; 94] = [
     73, 73, 73, 73, // 90-93
 ];
 
-/// Quantize quality string based on mode
-pub fn quantize_quality<'a>(quality: &'a str, mode: QualityMode) -> Cow<'a, str> {
+/// Quantize quality bytes based on mode
+pub fn quantize_quality<'a>(quality: &'a [u8], mode: QualityMode) -> Cow<'a, [u8]> {
     match mode {
         QualityMode::Lossless => Cow::Borrowed(quality),
         QualityMode::IlluminaBin => Cow::Owned(quantize_illumina(quality)),
@@ -29,17 +29,16 @@ pub fn quantize_quality<'a>(quality: &'a str, mode: QualityMode) -> Cow<'a, str>
             Cow::Borrowed(quality)
         }
         QualityMode::Discard => {
-            // Discard quality: replace all with minimum quality '!'
-            Cow::Owned("!".repeat(quality.len()))
+            Cow::Owned(vec![b'!'; quality.len()])
         }
     }
 }
 
 /// Apply 4-level binning (more aggressive than Illumina 8-level)
-fn quantize_four_level(quality: &str) -> String {
+fn quantize_four_level(quality: &[u8]) -> Vec<u8> {
     quality
-        .bytes()
-        .map(|qv| {
+        .iter()
+        .map(|&qv| {
             let phred = (qv as i32).saturating_sub(33).max(0).min(93);
             let binned = if phred < 10 {
                 6  // Low quality
@@ -50,32 +49,32 @@ fn quantize_four_level(quality: &str) -> String {
             } else {
                 37 // High quality
             };
-            (binned + 33) as u8 as char
+            (binned + 33) as u8
         })
         .collect()
 }
 
 /// Apply Illumina 8-level binning
-fn quantize_illumina(quality: &str) -> String {
+fn quantize_illumina(quality: &[u8]) -> Vec<u8> {
     quality
-        .bytes()
-        .map(|qv| {
+        .iter()
+        .map(|&qv| {
             let idx = (qv as usize).saturating_sub(33).min(93);
-            ILLUMINA_BINS[idx] as char
+            ILLUMINA_BINS[idx]
         })
         .collect()
 }
 
 /// Binary thresholding: high if >= threshold, low otherwise
-fn quantize_binary(quality: &str, threshold: u8, high: u8, low: u8) -> String {
+fn quantize_binary(quality: &[u8], threshold: u8, high: u8, low: u8) -> Vec<u8> {
     quality
-        .bytes()
-        .map(|qv| {
+        .iter()
+        .map(|&qv| {
             let phred = qv.saturating_sub(33);
             if phred >= threshold {
-                (33 + high) as char
+                33 + high
             } else {
-                (33 + low) as char
+                33 + low
             }
         })
         .collect()
@@ -87,25 +86,22 @@ mod tests {
 
     #[test]
     fn test_lossless() {
-        let quality = "IIIIIIII";
-        assert_eq!(quantize_quality(quality, QualityMode::Lossless), quality);
+        let quality = b"IIIIIIII";
+        assert_eq!(quantize_quality(quality, QualityMode::Lossless).as_ref(), quality);
     }
 
     #[test]
     fn test_illumina_binning() {
-        // Quality 40 (Phred 7) should map to bin
-        let quality = "!!!!!!!!"; // Phred 0
+        let quality = b"!!!!!!!!"; // Phred 0
         let binned = quantize_illumina(quality);
-        assert_eq!(binned.chars().next().unwrap(), '!'); // Should map to lowest bin
+        assert_eq!(binned[0], b'!'); // Should map to lowest bin
     }
 
     #[test]
     fn test_binary_threshold() {
-        // Mix of high and low quality
-        let quality = "!!!!IIII"; // Phred 0 and 40
+        let quality = b"!!!!IIII"; // Phred 0 and 40
         let binned = quantize_binary(quality, 20, 40, 6);
-        // First 4 should be low (6), last 4 should be high (40)
-        assert!(binned.starts_with("''''"));
-        assert!(binned.ends_with("IIII"));
+        assert_eq!(&binned[..4], b"''''");
+        assert_eq!(&binned[4..], b"IIII");
     }
 }

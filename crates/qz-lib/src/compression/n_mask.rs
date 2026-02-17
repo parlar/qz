@@ -18,9 +18,8 @@ pub struct NMaskEncoding {
 }
 
 /// Encode sequence with N-mask: 2-bit + bitmap
-pub fn encode_with_n_mask(seq: &str) -> NMaskEncoding {
+pub fn encode_with_n_mask(seq: &[u8]) -> NMaskEncoding {
     let len = seq.len();
-    let bytes = seq.as_bytes();
 
     // Allocate 2-bit sequence storage (4 bases per byte)
     let mut sequence_2bit = vec![0u8; (len + 3) / 4];
@@ -28,7 +27,7 @@ pub fn encode_with_n_mask(seq: &str) -> NMaskEncoding {
     // Allocate N-mask bitmap storage (8 bases per byte)
     let mut n_mask = vec![0u8; (len + 7) / 8];
 
-    for (i, &base) in bytes.iter().enumerate() {
+    for (i, &base) in seq.iter().enumerate() {
         // Encode base (N→A for 2-bit encoding)
         let base_2bit = match base.to_ascii_uppercase() {
             b'A' | b'N' => 0b00,  // N temporarily maps to A in 2-bit
@@ -59,7 +58,7 @@ pub fn encode_with_n_mask(seq: &str) -> NMaskEncoding {
 }
 
 /// Decode sequence with N-mask: restore original N positions
-pub fn decode_with_n_mask(encoding: &NMaskEncoding) -> String {
+pub fn decode_with_n_mask(encoding: &NMaskEncoding) -> Vec<u8> {
     let mut result = Vec::with_capacity(encoding.length);
 
     for i in 0..encoding.length {
@@ -88,7 +87,7 @@ pub fn decode_with_n_mask(encoding: &NMaskEncoding) -> String {
         result.push(base);
     }
 
-    String::from_utf8_lossy(&result).to_string()
+    result
 }
 
 /// Analyze N-base statistics for a sequence
@@ -129,35 +128,35 @@ mod tests {
 
     #[test]
     fn test_encode_decode_no_n() {
-        let seq = "ACGTACGT";
+        let seq = b"ACGTACGT";
         let encoded = encode_with_n_mask(seq);
         let decoded = decode_with_n_mask(&encoded);
-        assert_eq!(seq, decoded);
+        assert_eq!(decoded, b"ACGTACGT");
     }
 
     #[test]
     fn test_encode_decode_with_n() {
-        let seq = "ACNGTANNCGT";
+        let seq = b"ACNGTANNCGT";
         let encoded = encode_with_n_mask(seq);
         let decoded = decode_with_n_mask(&encoded);
-        assert_eq!(seq, decoded);
+        assert_eq!(decoded, b"ACNGTANNCGT");
     }
 
     #[test]
     fn test_encode_decode_all_n() {
-        let seq = "NNNNNNNN";
+        let seq = b"NNNNNNNN";
         let encoded = encode_with_n_mask(seq);
         let decoded = decode_with_n_mask(&encoded);
-        assert_eq!(seq, decoded);
+        assert_eq!(decoded, b"NNNNNNNN");
     }
 
     #[test]
     fn test_sparse_n() {
         // Typical Illumina: 1-5 N bases in 100bp read
-        let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTNACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTNACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let encoded = encode_with_n_mask(seq);
         let decoded = decode_with_n_mask(&encoded);
-        assert_eq!(seq, decoded);
+        assert_eq!(decoded, seq.as_slice());
 
         // Check storage efficiency (sequence is actually 104 bases)
         // 2-bit: 104 bases / 4 = 26 bytes

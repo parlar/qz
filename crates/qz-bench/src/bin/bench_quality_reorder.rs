@@ -358,7 +358,7 @@ fn main() {
 
     // === 7. fqzcomp_qual strat=0 (fast) ===
     {
-        let qual_refs: Vec<&str> = qualities.iter().map(|q| q.as_str()).collect();
+        let qual_refs: Vec<&[u8]> = qualities.iter().map(|q| q.as_bytes()).collect();
         let t = Instant::now();
         let compressed = fqzcomp::compress(&qual_refs, 0).unwrap();
         let elapsed = t.elapsed();
@@ -379,7 +379,7 @@ fn main() {
 
     // === 8. fqzcomp_qual strat=1 ===
     {
-        let qual_refs: Vec<&str> = qualities.iter().map(|q| q.as_str()).collect();
+        let qual_refs: Vec<&[u8]> = qualities.iter().map(|q| q.as_bytes()).collect();
         let t = Instant::now();
         let compressed = fqzcomp::compress(&qual_refs, 1).unwrap();
         let elapsed = t.elapsed();
@@ -395,7 +395,7 @@ fn main() {
 
     // === 9. fqzcomp_qual strat=2 ===
     {
-        let qual_refs: Vec<&str> = qualities.iter().map(|q| q.as_str()).collect();
+        let qual_refs: Vec<&[u8]> = qualities.iter().map(|q| q.as_bytes()).collect();
         let t = Instant::now();
         let compressed = fqzcomp::compress(&qual_refs, 2).unwrap();
         let elapsed = t.elapsed();
@@ -411,7 +411,7 @@ fn main() {
 
     // === 10. fqzcomp_qual strat=3 (max) ===
     {
-        let qual_refs: Vec<&str> = qualities.iter().map(|q| q.as_str()).collect();
+        let qual_refs: Vec<&[u8]> = qualities.iter().map(|q| q.as_bytes()).collect();
         let t = Instant::now();
         let compressed = fqzcomp::compress(&qual_refs, 3).unwrap();
         let elapsed = t.elapsed();
@@ -434,7 +434,7 @@ fn main() {
             sum / q.len().max(1) as u64
         });
 
-        let reordered_quals: Vec<&str> = perm_mean.iter().map(|&i| qualities[i as usize].as_str()).collect();
+        let reordered_quals: Vec<&[u8]> = perm_mean.iter().map(|&i| qualities[i as usize].as_bytes()).collect();
         let t = Instant::now();
         let compressed = fqzcomp::compress(&reordered_quals, 0).unwrap();
         let elapsed = t.elapsed();
@@ -470,7 +470,7 @@ fn main() {
         let mut perm_lex: Vec<u32> = (0..num_reads as u32).collect();
         perm_lex.sort_by(|&a, &b| qualities[a as usize].cmp(&qualities[b as usize]));
 
-        let reordered_quals: Vec<&str> = perm_lex.iter().map(|&i| qualities[i as usize].as_str()).collect();
+        let reordered_quals: Vec<&[u8]> = perm_lex.iter().map(|&i| qualities[i as usize].as_bytes()).collect();
         let t = Instant::now();
         let compressed = fqzcomp::compress(&reordered_quals, 0).unwrap();
         let elapsed = t.elapsed();

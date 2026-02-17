@@ -31,7 +31,7 @@ fn main() {
     let mut headers: Vec<String> = Vec::new();
 
     while let Some(rec) = reader.next().expect("read error") {
-        headers.push(rec.id);
+        headers.push(String::from_utf8(rec.id).expect("non-UTF8 header"));
         if headers.len() >= max_reads {
             break;
         }
@@ -104,7 +104,7 @@ fn main() {
 
     let mut mismatches = 0;
     for i in 0..n_reads {
-        if decompressed[i] != headers[i] {
+        if decompressed[i] != headers[i].as_bytes() {
             mismatches += 1;
             if mismatches <= 5 {
                 eprintln!(

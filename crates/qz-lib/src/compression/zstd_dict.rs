@@ -85,7 +85,7 @@ pub fn train_dictionary(samples: &[&[u8]], dict_size: usize) -> Result<Vec<u8>> 
 /// # Returns
 /// Trained dictionary
 pub fn train_from_quality_scores(
-    quality_strings: &[String],
+    quality_strings: &[Vec<u8>],
     dict_size: usize,
     sample_fraction: f64,
 ) -> Result<Vec<u8>> {
@@ -99,14 +99,14 @@ pub fn train_from_quality_scores(
 
     // Collect samples evenly distributed
     let samples: Vec<&[u8]> = if quality_strings.len() <= max_samples {
-        quality_strings.iter().map(|s| s.as_bytes()).collect()
+        quality_strings.iter().map(|s| s.as_slice()).collect()
     } else {
         let step = quality_strings.len() / max_samples;
         quality_strings
             .iter()
             .step_by(step)
             .take(max_samples)
-            .map(|s| s.as_bytes())
+            .map(|s| s.as_slice())
             .collect()
     };
 

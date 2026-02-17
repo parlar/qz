@@ -6,8 +6,91 @@
 
 use anyhow::Result;
 use tracing::info;
-use crate::cli::QualityCompressor;
+use crate::cli::{QualityCompressor, SequenceCompressor, HeaderCompressor};
 use super::*;
+
+// ── ByteBackend: trait-based dispatch for BSC/Zstd/OpenZL ─────────────────
+
+/// Backend byte-level compressor (BSC, Zstd, OpenZL).
+///
+/// Abstracts the `&[u8] -> Result<Vec<u8>>` compression/decompression
+/// shared by BSC, Zstd, and OpenZL. Special-case codecs (Fqzcomp, QualityCtx)
+/// operate on structured data and are excluded.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ByteBackend {
+    Bsc { use_static: bool },
+    Zstd { level: i32 },
+    OpenZl,
+}
+
+pub(crate) trait ByteCompressor {
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>>;
+    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>>;
+}
+
+impl ByteCompressor for ByteBackend {
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            ByteBackend::Bsc { use_static } => bsc_compress_parallel(data, *use_static),
+            ByteBackend::Zstd { level } => compress_zstd(data, *level),
+            ByteBackend::OpenZl => openzl::compress_parallel(data),
+        }
+    }
+
+    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            ByteBackend::Bsc { .. } => bsc::decompress_parallel(data),
+            ByteBackend::Zstd { .. } => decompress_zstd(data),
+            ByteBackend::OpenZl => openzl::decompress_parallel(data),
+        }
+    }
+}
+
+impl ByteBackend {
+    /// Create from QualityCompressor, if it is a byte-level backend.
+    /// Returns None for Fqzcomp and QualityCtx (they need structured data).
+    #[allow(dead_code)]
+    pub(crate) fn from_quality_compressor(
+        qc: QualityCompressor,
+        bsc_static: bool,
+        level: i32,
+    ) -> Option<Self> {
+        match qc {
+            QualityCompressor::Bsc => Some(ByteBackend::Bsc { use_static: bsc_static }),
+            QualityCompressor::Zstd => Some(ByteBackend::Zstd { level }),
+            QualityCompressor::OpenZl => Some(ByteBackend::OpenZl),
+            QualityCompressor::Fqzcomp | QualityCompressor::QualityCtx => None,
+        }
+    }
+
+    /// Create from SequenceCompressor.
+    #[allow(dead_code)]
+    pub(crate) fn from_sequence_compressor(
+        sc: SequenceCompressor,
+        bsc_static: bool,
+        level: i32,
+    ) -> Self {
+        match sc {
+            SequenceCompressor::Bsc => ByteBackend::Bsc { use_static: bsc_static },
+            SequenceCompressor::Zstd => ByteBackend::Zstd { level },
+            SequenceCompressor::OpenZl => ByteBackend::OpenZl,
+        }
+    }
+
+    /// Create from HeaderCompressor.
+    #[allow(dead_code)]
+    pub(crate) fn from_header_compressor(
+        hc: HeaderCompressor,
+        bsc_static: bool,
+        level: i32,
+    ) -> Self {
+        match hc {
+            HeaderCompressor::Bsc => ByteBackend::Bsc { use_static: bsc_static },
+            HeaderCompressor::Zstd => ByteBackend::Zstd { level },
+            HeaderCompressor::OpenZl => ByteBackend::OpenZl,
+        }
+    }
+}
 
 // ── Shared stream-building helpers ────────────────────────────────────────
 
@@ -16,13 +99,13 @@ fn build_header_stream(records: &[crate::io::FastqRecord]) -> Result<Vec<u8>> {
     let mut stream = Vec::new();
     for record in records {
         write_varint(&mut stream, record.id.len())?;
-        stream.extend_from_slice(record.id.as_bytes());
+        stream.extend_from_slice(&record.id);
     }
     Ok(stream)
 }
 
 /// Decode varint-prefixed header strings from decompressed data.
-fn decode_header_stream(decompressed: &[u8], num_reads: usize) -> Result<Vec<String>> {
+fn decode_header_stream(decompressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
     let mut headers = Vec::with_capacity(num_reads);
     let mut offset = 0;
     for _ in 0..num_reads {
@@ -31,10 +114,8 @@ fn decode_header_stream(decompressed: &[u8], num_reads: usize) -> Result<Vec<Str
         if offset + hdr_len > decompressed.len() {
             anyhow::bail!("Truncated header data at offset {}", offset);
         }
-        let header = String::from_utf8(decompressed[offset..offset + hdr_len].to_vec())
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in header: {}", e))?;
+        headers.push(decompressed[offset..offset + hdr_len].to_vec());
         offset += hdr_len;
-        headers.push(header);
     }
     Ok(headers)
 }
@@ -72,7 +153,7 @@ fn build_quality_model_stream(records: &[crate::io::FastqRecord], model: &qualit
 
 /// Compress headers stream with template encoding + Zstd.
 pub(crate) fn compress_headers(records: &[crate::io::FastqRecord], level: i32) -> Result<(Vec<u8>, read_id::ReadIdTemplate)> {
-    let read_ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+    let read_ids: Vec<String> = records.iter().map(|r| String::from_utf8_lossy(&r.id).into_owned()).collect();
     let encoded = read_id::compress_read_ids(&read_ids)?;
     let compressed = compress_zstd(&encoded.encoded_data, level)?;
     Ok((compressed, encoded.template))
@@ -86,7 +167,7 @@ pub(crate) fn compress_headers_bsc_with(records: &[crate::io::FastqRecord], bsc_
 }
 
 /// Decompress raw BSC-compressed headers.
-pub(super) fn decompress_headers_bsc(compressed: &[u8], num_reads: usize) -> Result<Vec<String>> {
+pub(super) fn decompress_headers_bsc(compressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
     let decompressed = bsc::decompress_parallel(compressed)?;
     decode_header_stream(&decompressed, num_reads)
 }
@@ -98,7 +179,7 @@ pub(super) fn compress_headers_openzl(records: &[crate::io::FastqRecord]) -> Res
 }
 
 /// Decompress raw OpenZL-compressed headers.
-pub(super) fn decompress_headers_openzl(compressed: &[u8], num_reads: usize) -> Result<Vec<String>> {
+pub(super) fn decompress_headers_openzl(compressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
     let decompressed = openzl::decompress_parallel(compressed)?;
     decode_header_stream(&decompressed, num_reads)
 }
@@ -114,7 +195,7 @@ pub(crate) fn compress_sequences_raw_bsc_with(records: &[crate::io::FastqRecord]
         let mut delta_reads = Vec::new();
         let mut delta_count = 0usize;
         for record in records {
-            if encode_sequence_delta(record.sequence.as_bytes(), &mut seq_stream, &mut delta_cache, &mut delta_reads)? {
+            if encode_sequence_delta(&record.sequence, &mut seq_stream, &mut delta_cache, &mut delta_reads)? {
                 delta_count += 1;
             }
         }
@@ -124,9 +205,9 @@ pub(crate) fn compress_sequences_raw_bsc_with(records: &[crate::io::FastqRecord]
         for record in records {
             write_varint(&mut seq_stream, record.sequence.len())?;
             if sequence_hints {
-                seq_stream.push(dna_utils::compute_sequence_hint(record.sequence.as_bytes()));
+                seq_stream.push(dna_utils::compute_sequence_hint(&record.sequence));
             }
-            seq_stream.extend_from_slice(record.sequence.as_bytes());
+            seq_stream.extend_from_slice(&record.sequence);
         }
     }
 
@@ -135,7 +216,7 @@ pub(crate) fn compress_sequences_raw_bsc_with(records: &[crate::io::FastqRecord]
 }
 
 /// Decompress raw ASCII BSC-compressed sequences.
-pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, encoding_type: u8) -> Result<Vec<String>> {
+pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, encoding_type: u8, const_seq_len: usize) -> Result<Vec<Vec<u8>>> {
     let decompressed = bsc::decompress_parallel(compressed)?;
     let mut sequences = Vec::with_capacity(num_reads);
     let mut offset = 0;
@@ -146,8 +227,12 @@ pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, 
     let mut delta_reads: Vec<Vec<u8>> = if decode_delta { Vec::with_capacity(num_reads) } else { Vec::new() };
 
     for _ in 0..num_reads {
-        let seq_len = read_varint(&decompressed, &mut offset)
-            .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length varint"))?;
+        let seq_len = if const_seq_len > 0 {
+            const_seq_len
+        } else {
+            read_varint(&decompressed, &mut offset)
+                .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length varint"))?
+        };
 
         if decode_delta {
             // Read flag byte
@@ -184,9 +269,7 @@ pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, 
                 }
                 offset += seq_len;
                 delta_reads.push(seq.clone());
-                let sequence = String::from_utf8(seq)
-                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in delta sequence: {}", e))?;
-                sequences.push(sequence);
+                sequences.push(seq);
             } else {
                 // Raw: read seq_len bytes directly
                 if offset + seq_len > decompressed.len() {
@@ -195,9 +278,7 @@ pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, 
                 let seq_bytes = decompressed[offset..offset + seq_len].to_vec();
                 offset += seq_len;
                 delta_reads.push(seq_bytes.clone());
-                let sequence = String::from_utf8(seq_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in sequence: {}", e))?;
-                sequences.push(sequence);
+                sequences.push(seq_bytes);
             }
         } else {
             if skip_hints {
@@ -206,10 +287,8 @@ pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, 
             if offset + seq_len > decompressed.len() {
                 anyhow::bail!("Truncated sequence data at offset {}", offset);
             }
-            let sequence = String::from_utf8(decompressed[offset..offset + seq_len].to_vec())
-                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in sequence: {}", e))?;
+            sequences.push(decompressed[offset..offset + seq_len].to_vec());
             offset += seq_len;
-            sequences.push(sequence);
         }
     }
 
@@ -221,7 +300,7 @@ pub(super) fn compress_sequences_raw_openzl(records: &[crate::io::FastqRecord]) 
     let mut seq_stream = Vec::new();
     for record in records {
         write_varint(&mut seq_stream, record.sequence.len())?;
-        seq_stream.extend_from_slice(record.sequence.as_bytes());
+        seq_stream.extend_from_slice(&record.sequence);
     }
 
     let compressed = openzl::compress_parallel(&seq_stream)?;
@@ -229,21 +308,23 @@ pub(super) fn compress_sequences_raw_openzl(records: &[crate::io::FastqRecord]) 
 }
 
 /// Decompress raw ASCII OpenZL-compressed sequences.
-pub(super) fn decompress_sequences_raw_openzl(compressed: &[u8], num_reads: usize) -> Result<Vec<String>> {
+pub(super) fn decompress_sequences_raw_openzl(compressed: &[u8], num_reads: usize, const_seq_len: usize) -> Result<Vec<Vec<u8>>> {
     let decompressed = openzl::decompress_parallel(compressed)?;
     let mut sequences = Vec::with_capacity(num_reads);
     let mut offset = 0;
 
     for _ in 0..num_reads {
-        let seq_len = read_varint(&decompressed, &mut offset)
-            .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length varint"))?;
+        let seq_len = if const_seq_len > 0 {
+            const_seq_len
+        } else {
+            read_varint(&decompressed, &mut offset)
+                .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length varint"))?
+        };
         if offset + seq_len > decompressed.len() {
             anyhow::bail!("Truncated sequence data at offset {}", offset);
         }
-        let sequence = String::from_utf8(decompressed[offset..offset + seq_len].to_vec())
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in sequence: {}", e))?;
+        sequences.push(decompressed[offset..offset + seq_len].to_vec());
         offset += seq_len;
-        sequences.push(sequence);
     }
 
     Ok(sequences)
@@ -270,7 +351,7 @@ pub(super) fn compress_sequences_2bit_bsc_with(records: &[crate::io::FastqRecord
 }
 
 /// Decompress 2-bit BSC-compressed sequences with N-mask.
-pub(super) fn decompress_sequences_2bit_bsc(sequences: &[u8], nmasks: &[u8], num_reads: usize) -> Result<Vec<String>> {
+pub(super) fn decompress_sequences_2bit_bsc(sequences: &[u8], nmasks: &[u8], num_reads: usize, const_seq_len: usize) -> Result<Vec<Vec<u8>>> {
     let (seq_data, nmask_data) = rayon::join(
         || bsc::decompress_parallel(sequences),
         || bsc::decompress_parallel(nmasks),
@@ -283,8 +364,12 @@ pub(super) fn decompress_sequences_2bit_bsc(sequences: &[u8], nmasks: &[u8], num
     let mut nmask_offset = 0;
 
     for _ in 0..num_reads {
-        let seq_len = read_varint(&seq_data, &mut seq_offset)
-            .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length varint"))?;
+        let seq_len = if const_seq_len > 0 {
+            const_seq_len
+        } else {
+            read_varint(&seq_data, &mut seq_offset)
+                .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length varint"))?
+        };
         let seq_2bit_len = (seq_len + 3) / 4;
         if seq_offset + seq_2bit_len > seq_data.len() {
             anyhow::bail!("Truncated 2-bit sequence data at offset {}", seq_offset);
@@ -312,16 +397,6 @@ pub(super) fn decompress_sequences_2bit_bsc(sequences: &[u8], nmasks: &[u8], num
     Ok(decoded)
 }
 
-/// Compress sequences with arithmetic coding.
-pub(super) fn compress_sequences_arithmetic(records: &[crate::io::FastqRecord]) -> Result<Vec<u8>> {
-    let sequences: Vec<String> = records
-        .iter()
-        .map(|r| r.sequence.clone())
-        .collect();
-
-    arithmetic_sequence::encode_sequences_arithmetic(&sequences)
-}
-
 // ── Qualities ──────────────────────────────────────────────────────────────
 
 /// Compress qualities stream (standard mode, dispatches by compressor).
@@ -337,14 +412,9 @@ pub(crate) fn compress_qualities_with(records: &[crate::io::FastqRecord], binnin
     }
 
     let quality_stream = build_quality_stream(records, binning)?;
-
-    match compressor {
-        QualityCompressor::Zstd => compress_zstd(&quality_stream, level),
-        QualityCompressor::Bsc => bsc_compress_parallel(&quality_stream, bsc_static),
-        QualityCompressor::OpenZl => openzl::compress_parallel(&quality_stream),
-        QualityCompressor::Fqzcomp => unreachable!(),
-        QualityCompressor::QualityCtx => unreachable!("quality_ctx handled separately"),
-    }
+    let backend = ByteBackend::from_quality_compressor(compressor, bsc_static, level)
+        .expect("Fqzcomp handled above, QualityCtx handled separately");
+    backend.compress(&quality_stream)
 }
 
 /// Compress qualities stream with dictionary.
@@ -383,7 +453,7 @@ pub(super) fn compress_qualities_with_model(
     quality_compressor: QualityCompressor,
     bsc_static: bool,
 ) -> Result<(Vec<u8>, quality_model::QualityModel)> {
-    let quality_strings: Vec<String> = records
+    let quality_strings: Vec<Vec<u8>> = records
         .iter()
         .filter_map(|r| r.quality.clone())
         .collect();
@@ -400,16 +470,16 @@ pub(super) fn compress_qualities_with_model(
 
     let quality_stream = build_quality_model_stream(records, &model)?;
 
-    let compressed = match quality_compressor {
-        QualityCompressor::Bsc => bsc_compress_parallel(&quality_stream, bsc_static)?,
-        QualityCompressor::Zstd => compress_zstd(&quality_stream, level)?,
-        QualityCompressor::OpenZl => openzl::compress_parallel(&quality_stream)?,
+    let backend = match quality_compressor {
         QualityCompressor::Fqzcomp => {
             info!("Note: fqzcomp doesn't support quality modeling, using BSC for model deltas");
-            bsc_compress_parallel(&quality_stream, bsc_static)?
+            ByteBackend::Bsc { use_static: bsc_static }
         }
         QualityCompressor::QualityCtx => unreachable!("quality_ctx handled separately"),
+        _ => ByteBackend::from_quality_compressor(quality_compressor, bsc_static, level)
+            .expect("Fqzcomp/QualityCtx handled above"),
     };
+    let compressed = backend.compress(&quality_stream)?;
 
     Ok((compressed, model))
 }
@@ -418,7 +488,7 @@ pub(super) fn compress_qualities_with_model(
 pub(super) fn compress_qualities_with_delta(records: &[crate::io::FastqRecord], level: i32) -> Result<Vec<u8>> {
     use std::io::Write;
 
-    let quality_strings: Vec<String> = records
+    let quality_strings: Vec<Vec<u8>> = records
         .iter()
         .filter_map(|r| r.quality.clone())
         .collect();
@@ -443,38 +513,13 @@ pub(super) fn compress_qualities_with_delta(records: &[crate::io::FastqRecord], 
     compress_zstd(&quality_stream, level)
 }
 
-/// Compress qualities with arithmetic coding.
-pub(super) fn compress_qualities_arithmetic(records: &[crate::io::FastqRecord]) -> Result<Vec<u8>> {
-    let sequences: Vec<String> = records
-        .iter()
-        .map(|r| r.sequence.clone())
-        .collect();
-
-    let qualities: Vec<String> = records
-        .iter()
-        .filter_map(|r| r.quality.clone())
-        .collect();
-
-    if qualities.is_empty() {
-        anyhow::bail!("No quality scores for arithmetic coding");
-    }
-
-    let read_length = if !records.is_empty() {
-        records[0].sequence.len()
-    } else {
-        anyhow::bail!("No records to compress");
-    };
-
-    arithmetic_quality::encode_qualities_arithmetic(&qualities, &sequences, read_length)
-}
-
 /// Compress qualities with model and dictionary.
 pub(super) fn compress_qualities_with_model_and_dict(
     records: &[crate::io::FastqRecord],
     dictionary: &[u8],
     level: i32,
 ) -> Result<(Vec<u8>, quality_model::QualityModel)> {
-    let quality_strings: Vec<String> = records
+    let quality_strings: Vec<Vec<u8>> = records
         .iter()
         .filter_map(|r| r.quality.clone())
         .collect();
@@ -504,7 +549,7 @@ pub(super) fn compress_qualities_with_delta_and_dict(
 ) -> Result<Vec<u8>> {
     use std::io::Write;
 
-    let quality_strings: Vec<String> = records
+    let quality_strings: Vec<Vec<u8>> = records
         .iter()
         .filter_map(|r| r.quality.clone())
         .collect();
@@ -534,11 +579,13 @@ pub(super) fn compress_qualities_with_delta_and_dict(
 /// Dispatch quality decompression by compressor type.
 pub(super) fn decompress_qualities_data(compressed: &[u8], compressor: QualityCompressor) -> Result<Vec<u8>> {
     match compressor {
-        QualityCompressor::Zstd => decompress_zstd(compressed),
-        QualityCompressor::Bsc => bsc::decompress_parallel(compressed),
-        QualityCompressor::OpenZl => openzl::decompress_parallel(compressed),
         QualityCompressor::Fqzcomp => decompress_qualities_fqzcomp_multiblock(compressed),
         QualityCompressor::QualityCtx => unreachable!("quality_ctx decompression handled separately"),
+        _ => {
+            let backend = ByteBackend::from_quality_compressor(compressor, false, 0)
+                .expect("Fqzcomp/QualityCtx handled above");
+            backend.decompress(compressed)
+        }
     }
 }
 
@@ -591,7 +638,7 @@ pub(super) fn compress_qualities_fqzcomp(records: &[crate::io::FastqRecord]) -> 
 
     const FQZCOMP_SUB_CHUNK: usize = 500_000;
 
-    let qual_strs: Vec<&str> = records.iter()
+    let qual_strs: Vec<&[u8]> = records.iter()
         .filter_map(|r| r.quality.as_deref())
         .collect();
 
@@ -602,7 +649,7 @@ pub(super) fn compress_qualities_fqzcomp(records: &[crate::io::FastqRecord]) -> 
     // Compute mean quality per read (1 byte each)
     let sort_keys: Vec<u8> = qual_strs.iter()
         .map(|q| {
-            let sum: u64 = q.bytes().map(|b| b as u64).sum();
+            let sum: u64 = q.iter().map(|&b| b as u64).sum();
             (sum / q.len().max(1) as u64) as u8
         })
         .collect();
@@ -612,7 +659,7 @@ pub(super) fn compress_qualities_fqzcomp(records: &[crate::io::FastqRecord]) -> 
     indices.sort_by_key(|&i| sort_keys[i]);
 
     // Reorder quality strings
-    let sorted_quals: Vec<&str> = indices.iter().map(|&i| qual_strs[i]).collect();
+    let sorted_quals: Vec<&[u8]> = indices.iter().map(|&i| qual_strs[i]).collect();
 
     let num_sub_chunks = (sorted_quals.len() + FQZCOMP_SUB_CHUNK - 1) / FQZCOMP_SUB_CHUNK;
     info!("fqzcomp: {} reads, sorting by mean quality, {} sub-chunks, compressing with strat=0",

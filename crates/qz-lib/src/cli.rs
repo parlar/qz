@@ -8,6 +8,10 @@ pub enum ReorderMode {
     Global,
 }
 
+/// Core compression configuration.
+///
+/// Production fields are directly on this struct. Experimental/advanced options
+/// (compressor selection, encoding variants, reordering) live in `advanced`.
 #[derive(Clone)]
 pub struct CompressConfig {
     /// Input FASTQ file(s) (one for single-end, two for paired-end)
@@ -20,16 +24,39 @@ pub struct CompressConfig {
     pub threads: usize,
     /// Do not preserve quality values
     pub no_quality: bool,
-    /// Input files are gzipped FASTQ
-    pub gzipped: bool,
     /// Input is FASTA format (no quality scores)
     pub fasta: bool,
     /// Quality compression mode
     pub quality_mode: QualityMode,
-    /// Enable delta encoding for sequences (experimental)
-    pub delta_encoding: bool,
-    /// Enable run-length encoding for homopolymers (experimental)
-    pub rle_encoding: bool,
+    /// Ultra compression with optional level (1-5, 0=auto)
+    pub ultra: Option<u8>,
+    /// Advanced/experimental options (compressor selection, encoding variants, etc.)
+    pub advanced: AdvancedOptions,
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            input: Vec::new(),
+            output: PathBuf::new(),
+            working_dir: PathBuf::from("."),
+            threads: 0,
+            no_quality: false,
+            fasta: false,
+            quality_mode: QualityMode::Lossless,
+            ultra: None,
+            advanced: AdvancedOptions::default(),
+        }
+    }
+}
+
+/// Advanced/experimental compression options.
+///
+/// These control compressor selection, encoding variants, reordering, and other
+/// features not exposed in the production CLI. Used by integration tests and
+/// benchmark code.
+#[derive(Clone)]
+pub struct AdvancedOptions {
     /// Enable positional quality modeling (experimental)
     pub quality_modeling: bool,
     /// Enable quality delta encoding between adjacent reads (experimental)
@@ -40,12 +67,6 @@ pub struct CompressConfig {
     pub dict_size: usize,
     /// Compression level for legacy zstd mode (1-22)
     pub compression_level: i32,
-    /// Enable arithmetic coding for sequences and qualities (experimental)
-    pub arithmetic: bool,
-    /// Enable de Bruijn graph compression for sequences
-    pub debruijn: bool,
-    /// K-mer size for de Bruijn / reference compression (0 = auto)
-    pub kmer_size: usize,
     /// Quality score compressor
     pub quality_compressor: QualityCompressor,
     /// Sequence compressor
@@ -66,39 +87,22 @@ pub struct CompressConfig {
     pub sequence_hints: bool,
     /// Inline delta encoding against cached similar reads
     pub sequence_delta: bool,
-    /// Two-pass pattern routing for BWT clustering
-    pub factorize: bool,
     /// Local reordering with delta encoding
     pub local_reorder: bool,
-    /// Ultra compression with optional level (1-5, 0=auto)
-    pub ultra: Option<u8>,
     /// Deprecated: use ultra level 2 instead
     pub fast_ultra: bool,
     /// Number of reads per quality_ctx sub-block (default 500K)
     pub quality_ctx_block_size: usize,
 }
 
-impl Default for CompressConfig {
+impl Default for AdvancedOptions {
     fn default() -> Self {
         Self {
-            input: Vec::new(),
-            output: PathBuf::new(),
-            working_dir: PathBuf::from("."),
-            threads: 0,
-            no_quality: false,
-            gzipped: false,
-            fasta: false,
-            quality_mode: QualityMode::Lossless,
-            delta_encoding: false,
-            rle_encoding: false,
             quality_modeling: false,
             quality_delta: false,
             dict_training: false,
             dict_size: 64,
             compression_level: 3,
-            arithmetic: false,
-            debruijn: false,
-            kmer_size: 0,
             quality_compressor: QualityCompressor::Bsc,
             sequence_compressor: SequenceCompressor::Bsc,
             header_compressor: HeaderCompressor::Bsc,
@@ -109,9 +113,7 @@ impl Default for CompressConfig {
             reorder: None,
             sequence_hints: false,
             sequence_delta: false,
-            factorize: false,
             local_reorder: false,
-            ultra: None,
             fast_ultra: false,
             quality_ctx_block_size: 500_000,
         }

@@ -95,16 +95,18 @@ All three streams compress **in parallel** via `rayon::join` (headers parallel w
 
 ## Archive Format
 ```
-[encoding_type: 1B] [arithmetic_mode: 1B]
-[read_lengths (if arithmetic)]
+[encoding_type: 1B] [flags: 1B (bit0=arithmetic, bit1=const_lengths)]
+[read_lengths (if flags bit0)]
 [quality_binning: 1B] [quality_compressor: 1B] [sequence_compressor: 1B] [header_compressor: 1B]
 [quality_model (if enabled)] [quality_delta: 1B] [quality_dict (if enabled)]
 [template_prefix + has_comment]
 [num_reads: 8B] [headers_len: 8B] [sequences_len: 8B] [nmasks_len: 8B] [qualities_len: 8B]
+[const_seq_len: 4B] [const_qual_len: 4B]  (only if flags bit1 set)
 [headers data] [sequences data] [nmasks data] [qualities data]
 ```
 
 Compressor codes: zstd=0, bsc=1. Header compressor: zstd=0 (template+zstd), bsc=1 (raw+bsc).
+When flags bit1 is set, sequence and quality streams omit per-record varint length prefixes (lengths are constant).
 
 ## CompressConfig Gotcha
 When adding new fields to `CompressConfig` in `crates/qz-lib/src/cli.rs`, you must update:
@@ -115,9 +117,12 @@ When adding new fields to `CompressConfig` in `crates/qz-lib/src/cli.rs`, you mu
 ## Compression Performance (1M reads, 150bp WGS)
 | Tool | Ratio | Compress | Decompress |
 |------|-------|----------|------------|
-| QZ (BSC default) | 7.67x | 3.4s | 2.4s |
+| QZ (BSC default) | 7.97x | 3.4s | 2.4s |
 | SPRING (reorders) | 8.06x | 104s | 34s |
 | gzip | 4.76x | 32s | 1.8s |
+
+## Changelog
+All user-visible changes (new features, breaking changes, removals, bug fixes) must be recorded in `CHANGELOG.md` at the project root. Update it as part of the same change, not as a separate step.
 
 ## Test Data
 If available in `real_data/`:

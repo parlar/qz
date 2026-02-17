@@ -21,7 +21,7 @@ pub struct QualityModel {
 }
 
 /// Build a quality model from a set of reads
-pub fn build_quality_model(quality_strings: &[String]) -> Result<QualityModel> {
+pub fn build_quality_model(quality_strings: &[Vec<u8>]) -> Result<QualityModel> {
     if quality_strings.is_empty() {
         anyhow::bail!("Cannot build quality model from empty dataset");
     }
@@ -46,7 +46,7 @@ pub fn build_quality_model(quality_strings: &[String]) -> Result<QualityModel> {
             continue; // Skip reads of different lengths
         }
 
-        for (pos, &qual_ascii) in qual.as_bytes().iter().enumerate() {
+        for (pos, &qual_ascii) in qual.iter().enumerate() {
             let phred = qual_ascii.saturating_sub(33);
             position_qualities[pos].push(phred);
         }
@@ -72,10 +72,10 @@ pub fn build_quality_model(quality_strings: &[String]) -> Result<QualityModel> {
 
 /// Encode quality string using positional model
 /// Returns delta-encoded values (signed differences from expected)
-pub fn encode_with_model(quality: &str, model: &QualityModel) -> Vec<i8> {
+pub fn encode_with_model(quality: &[u8], model: &QualityModel) -> Vec<i8> {
     let mut deltas = Vec::with_capacity(quality.len());
 
-    for (pos, &qual_ascii) in quality.as_bytes().iter().enumerate() {
+    for (pos, &qual_ascii) in quality.iter().enumerate() {
         let phred = qual_ascii.saturating_sub(33) as i16;
 
         // Get expected quality at this position
@@ -95,7 +95,7 @@ pub fn encode_with_model(quality: &str, model: &QualityModel) -> Vec<i8> {
 }
 
 /// Decode quality string from delta-encoded values
-pub fn decode_with_model(deltas: &[i8], model: &QualityModel) -> String {
+pub fn decode_with_model(deltas: &[i8], model: &QualityModel) -> Vec<u8> {
     let mut quality_bytes = Vec::with_capacity(deltas.len());
 
     for (pos, &delta) in deltas.iter().enumerate() {
@@ -112,7 +112,7 @@ pub fn decode_with_model(deltas: &[i8], model: &QualityModel) -> String {
         quality_bytes.push(qual_ascii);
     }
 
-    String::from_utf8_lossy(&quality_bytes).to_string()
+    quality_bytes
 }
 
 /// Serialize quality model to bytes
@@ -172,9 +172,9 @@ mod tests {
     #[test]
     fn test_build_model() {
         let qualities = vec![
-            "IIIIIIIIHHHHGGGGFFFF".to_string(),
-            "IIIIIIIIHHHHGGGGEEEE".to_string(),
-            "IIIIIIIIHHHHGGGGFFFF".to_string(),
+            b"IIIIIIIIHHHHGGGGFFFF".to_vec(),
+            b"IIIIIIIIHHHHGGGGEEEE".to_vec(),
+            b"IIIIIIIIHHHHGGGGFFFF".to_vec(),
         ];
 
         let model = build_quality_model(&qualities).unwrap();
@@ -189,17 +189,17 @@ mod tests {
     #[test]
     fn test_encode_decode() {
         let qualities = vec![
-            "IIIIIHHHHGGGGFFFF".to_string(),
-            "IIIIIHHHHGGGGEEEE".to_string(),
+            b"IIIIIHHHHGGGGFFFF".to_vec(),
+            b"IIIIIHHHHGGGGEEEE".to_vec(),
         ];
 
         let model = build_quality_model(&qualities).unwrap();
-        let test_qual = "IIIIIHHHHGGGGFFFF";
+        let test_qual = b"IIIIIHHHHGGGGFFFF";
 
         let deltas = encode_with_model(test_qual, &model);
         let decoded = decode_with_model(&deltas, &model);
 
-        assert_eq!(test_qual, decoded);
+        assert_eq!(test_qual.to_vec(), decoded);
     }
 
     #[test]
@@ -219,9 +219,9 @@ mod tests {
     #[test]
     fn test_deltas_are_small() {
         let qualities = vec![
-            "IIIIIHHHHHGGGGGFFFFF".to_string(),
-            "IIIIIHHHHHGGGGGFFFFF".to_string(),
-            "IIIIIHHHHHGGGGGFFFFF".to_string(),
+            b"IIIIIHHHHHGGGGGFFFFF".to_vec(),
+            b"IIIIIHHHHHGGGGGFFFFF".to_vec(),
+            b"IIIIIHHHHHGGGGGFFFFF".to_vec(),
         ];
 
         let model = build_quality_model(&qualities).unwrap();

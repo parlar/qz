@@ -101,15 +101,14 @@ impl QualityBinning {
 }
 
 /// Pack quality scores with variable bit width
-pub fn pack_qualities(qualities: &str, binning: QualityBinning) -> Vec<u8> {
-    let bytes = qualities.as_bytes();
+pub fn pack_qualities(qualities: &[u8], binning: QualityBinning) -> Vec<u8> {
     let bits_per_qual = binning.bits_per_quality();
 
-    let mut packed = Vec::with_capacity((bytes.len() * bits_per_qual + 7) / 8);
+    let mut packed = Vec::with_capacity((qualities.len() * bits_per_qual + 7) / 8);
     let mut buffer = 0u64;
     let mut bits_in_buffer = 0;
 
-    for &qual_ascii in bytes {
+    for &qual_ascii in qualities {
         // Convert ASCII to Phred (assuming Phred+33 encoding)
         let phred = qual_ascii.saturating_sub(33);
         let encoded = binning.encode(phred);
@@ -135,7 +134,7 @@ pub fn pack_qualities(qualities: &str, binning: QualityBinning) -> Vec<u8> {
 }
 
 /// Unpack quality scores
-pub fn unpack_qualities(packed: &[u8], length: usize, binning: QualityBinning) -> String {
+pub fn unpack_qualities(packed: &[u8], length: usize, binning: QualityBinning) -> Vec<u8> {
     let bits_per_qual = binning.bits_per_quality();
     let mask = (1u64 << bits_per_qual) - 1;
 
@@ -161,8 +160,7 @@ pub fn unpack_qualities(packed: &[u8], length: usize, binning: QualityBinning) -
         bits_in_buffer = bits_in_buffer.saturating_sub(bits_per_qual);
     }
 
-    // SAFETY: all quality bytes are phred+33 (range 33-126), guaranteed valid ASCII/UTF-8
-    unsafe { String::from_utf8_unchecked(qualities) }
+    qualities
 }
 
 /// Unpack quality scores directly to a writer, avoiding intermediate String allocation
@@ -266,7 +264,7 @@ pub fn compress_columnar(
     let mut header_stream = Vec::new();
     for record in records {
         write_varint(&mut header_stream, record.id.len())?;
-        header_stream.write_all(record.id.as_bytes())?;
+        header_stream.write_all(&record.id)?;
         stats.original_size += record.id.len() + 1; // +1 for @ line
     }
 

@@ -39,7 +39,7 @@ unsafe extern "C" {
 /// `qualities` is a slice of quality strings (one per read).
 /// `strat` controls compression strategy (0=fast, 1-3=higher compression).
 /// Returns compressed bytes.
-pub fn compress(qualities: &[&str], strat: i32) -> Result<Vec<u8>> {
+pub fn compress(qualities: &[&[u8]], strat: i32) -> Result<Vec<u8>> {
     if qualities.is_empty() {
         return Ok(Vec::new());
     }
@@ -51,7 +51,7 @@ pub fn compress(qualities: &[&str], strat: i32) -> Result<Vec<u8>> {
     let flags: Vec<u32> = vec![0; qualities.len()]; // No flags needed
 
     for q in qualities {
-        concat.extend_from_slice(q.as_bytes());
+        concat.extend_from_slice(q);
         lengths.push(q.len() as u32);
     }
 
@@ -134,10 +134,10 @@ mod tests {
 
     #[test]
     fn test_roundtrip_strat1() {
-        let qualities = vec![
-            "IIIIIIIIIIIIIIIIIIIIIIIII",
-            "FFFFFFFFFFFFFFFFFFFF!!!!",
-            "ABCDEFGHIJKLMNOPQRSTUVWX",
+        let qualities: Vec<&[u8]> = vec![
+            b"IIIIIIIIIIIIIIIIIIIIIIIII",
+            b"FFFFFFFFFFFFFFFFFFFF!!!!",
+            b"ABCDEFGHIJKLMNOPQRSTUVWX",
         ];
         let compressed = compress(&qualities, 1).unwrap();
         let (decompressed, lengths) = decompress(&compressed, qualities.len()).unwrap();
@@ -145,20 +145,19 @@ mod tests {
         let mut offset = 0;
         for (i, q) in qualities.iter().enumerate() {
             assert_eq!(lengths[i] as usize, q.len());
-            let decompressed_q = std::str::from_utf8(&decompressed[offset..offset + q.len()]).unwrap();
-            assert_eq!(decompressed_q, *q);
+            assert_eq!(&decompressed[offset..offset + q.len()], *q);
             offset += q.len();
         }
     }
 
     #[test]
     fn test_roundtrip_strat0() {
-        let qualities = vec![
-            "BBBBAAAABBBBAAAA",
-            "DDDDDDDDDDDDDDDD",
-            "FFFFFFFFFFFFFFFF",
-            "HHHHHHHHHHHHHHHH",
-            "IIIIIIIIIIIIIIII",
+        let qualities: Vec<&[u8]> = vec![
+            b"BBBBAAAABBBBAAAA",
+            b"DDDDDDDDDDDDDDDD",
+            b"FFFFFFFFFFFFFFFF",
+            b"HHHHHHHHHHHHHHHH",
+            b"IIIIIIIIIIIIIIII",
         ];
         let compressed = compress(&qualities, 0).unwrap();
         let (decompressed, lengths) = decompress(&compressed, qualities.len()).unwrap();
@@ -166,8 +165,7 @@ mod tests {
         let mut offset = 0;
         for (i, q) in qualities.iter().enumerate() {
             assert_eq!(lengths[i] as usize, q.len(), "Length mismatch for read {}", i);
-            let d = std::str::from_utf8(&decompressed[offset..offset + q.len()]).unwrap();
-            assert_eq!(d, *q, "Data mismatch for read {}", i);
+            assert_eq!(&decompressed[offset..offset + q.len()], *q, "Data mismatch for read {}", i);
             offset += q.len();
         }
     }

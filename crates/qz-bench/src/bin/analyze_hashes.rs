@@ -21,7 +21,7 @@ fn main() {
     while let Some(rec) = reader.next().expect("read error") {
         if total >= max_reads { break; }
         total += 1;
-        let h = compute_min_syncmer_hash(rec.sequence.as_bytes());
+        let h = compute_min_syncmer_hash(&rec.sequence);
         if h == u64::MAX {
             no_hash += 1;
         } else {

@@ -10,7 +10,7 @@ use anyhow::Result;
 
 /// Encode quality strings as deltas from previous read
 /// First read is stored as-is, subsequent reads as signed differences
-pub fn encode_quality_deltas(quality_strings: &[String]) -> Vec<Vec<i8>> {
+pub fn encode_quality_deltas(quality_strings: &[Vec<u8>]) -> Vec<Vec<i8>> {
     if quality_strings.is_empty() {
         return Vec::new();
     }
@@ -18,7 +18,7 @@ pub fn encode_quality_deltas(quality_strings: &[String]) -> Vec<Vec<i8>> {
     let mut encoded = Vec::with_capacity(quality_strings.len());
 
     // First quality string is stored as absolute values
-    let first_qual = quality_strings[0].as_bytes();
+    let first_qual = &quality_strings[0];
     let first_deltas: Vec<i8> = first_qual
         .iter()
         .map(|&q| (q.saturating_sub(33)) as i8)
@@ -27,8 +27,8 @@ pub fn encode_quality_deltas(quality_strings: &[String]) -> Vec<Vec<i8>> {
 
     // Subsequent quality strings are stored as deltas
     for i in 1..quality_strings.len() {
-        let prev_qual = quality_strings[i - 1].as_bytes();
-        let curr_qual = quality_strings[i].as_bytes();
+        let prev_qual = &quality_strings[i - 1];
+        let curr_qual = &quality_strings[i];
 
         let mut deltas = Vec::with_capacity(curr_qual.len());
 
@@ -55,12 +55,12 @@ pub fn encode_quality_deltas(quality_strings: &[String]) -> Vec<Vec<i8>> {
 }
 
 /// Decode quality strings from delta encoding
-pub fn decode_quality_deltas(encoded: &[Vec<i8>]) -> Result<Vec<String>> {
+pub fn decode_quality_deltas(encoded: &[Vec<i8>]) -> Result<Vec<Vec<u8>>> {
     if encoded.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut decoded: Vec<Vec<u8>> = Vec::with_capacity(encoded.len());
 
     // First quality string is stored as absolute values
     let first_qual: Vec<u8> = encoded[0]
@@ -70,11 +70,11 @@ pub fn decode_quality_deltas(encoded: &[Vec<i8>]) -> Result<Vec<String>> {
             phred_u8 + 33
         })
         .collect();
-    decoded.push(String::from_utf8_lossy(&first_qual).to_string());
+    decoded.push(first_qual);
 
     // Decode subsequent quality strings using deltas
     for i in 1..encoded.len() {
-        let prev_qual = decoded[i - 1].as_bytes();
+        let prev_qual = &decoded[i - 1];
         let deltas = &encoded[i];
 
         let mut curr_qual = Vec::with_capacity(deltas.len());
@@ -92,7 +92,7 @@ pub fn decode_quality_deltas(encoded: &[Vec<i8>]) -> Result<Vec<String>> {
             curr_qual.push(curr_phred + 33);
         }
 
-        decoded.push(String::from_utf8_lossy(&curr_qual).to_string());
+        decoded.push(curr_qual);
     }
 
     Ok(decoded)
@@ -160,9 +160,9 @@ mod tests {
     #[test]
     fn test_identical_qualities() {
         let qualities = vec![
-            "IIIIIIIIII".to_string(),
-            "IIIIIIIIII".to_string(),
-            "IIIIIIIIII".to_string(),
+            b"IIIIIIIIII".to_vec(),
+            b"IIIIIIIIII".to_vec(),
+            b"IIIIIIIIII".to_vec(),
         ];
 
         let encoded = encode_quality_deltas(&qualities);
@@ -179,9 +179,9 @@ mod tests {
     #[test]
     fn test_similar_qualities() {
         let qualities = vec![
-            "IIIIIHHHHH".to_string(),
-            "IIIIIHHHHG".to_string(), // Last base differs by 1
-            "IIIIIHHHHH".to_string(), // Back to original
+            b"IIIIIHHHHH".to_vec(),
+            b"IIIIIHHHHG".to_vec(), // Last base differs by 1
+            b"IIIIIHHHHH".to_vec(), // Back to original
         ];
 
         let encoded = encode_quality_deltas(&qualities);
@@ -197,9 +197,9 @@ mod tests {
     #[test]
     fn test_different_lengths() {
         let qualities = vec![
-            "IIIII".to_string(),
-            "IIIIIHHHH".to_string(), // Longer
-            "III".to_string(),       // Shorter
+            b"IIIII".to_vec(),
+            b"IIIIIHHHH".to_vec(), // Longer
+            b"III".to_vec(),       // Shorter
         ];
 
         let encoded = encode_quality_deltas(&qualities);
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let qualities: Vec<String> = vec![];
+        let qualities: Vec<Vec<u8>> = vec![];
         let encoded = encode_quality_deltas(&qualities);
         let decoded = decode_quality_deltas(&encoded).unwrap();
         assert_eq!(qualities, decoded);
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_single_quality() {
-        let qualities = vec!["IIIII".to_string()];
+        let qualities = vec![b"IIIII".to_vec()];
         let encoded = encode_quality_deltas(&qualities);
         let decoded = decode_quality_deltas(&encoded).unwrap();
         assert_eq!(qualities, decoded);

@@ -55,17 +55,18 @@ pub fn compress_headers_columnar(headers: &[&str]) -> Result<Vec<u8>> {
 }
 
 /// Decompress columnar-encoded headers.
-pub fn decompress_headers_columnar(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
+pub fn decompress_headers_columnar(data: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
-    match data[0] {
+    let strings = match data[0] {
         0x00 => decompress_raw_fallback(&data[1..], num_reads),
         0x01 => decompress_sra(&data[1..], num_reads),
         0x02 => decompress_casava(&data[1..], num_reads),
         v => anyhow::bail!("Unknown header_col version: {}", v),
-    }
+    }?;
+    Ok(strings.into_iter().map(String::into_bytes).collect())
 }
 
 // ========================================================================
@@ -674,7 +675,7 @@ mod tests {
         assert_eq!(compressed[0], 0x01); // SRA format
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -689,7 +690,7 @@ mod tests {
         assert_eq!(compressed[0], 0x01);
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -705,7 +706,7 @@ mod tests {
         assert_eq!(compressed[0], 0x02); // Casava format
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -720,7 +721,7 @@ mod tests {
         assert_eq!(compressed[0], 0x02);
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -737,7 +738,7 @@ mod tests {
         assert_eq!(compressed[0], 0x02); // Casava format
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -753,7 +754,7 @@ mod tests {
         assert_eq!(compressed[0], 0x02);
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -769,7 +770,7 @@ mod tests {
         assert_eq!(compressed[0], 0x02);
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 
@@ -784,7 +785,7 @@ mod tests {
         assert_eq!(compressed[0], 0x00); // raw fallback
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
-            assert_eq!(*orig, dec.as_str());
+            assert_eq!(orig.as_bytes(), dec.as_slice());
         }
     }
 

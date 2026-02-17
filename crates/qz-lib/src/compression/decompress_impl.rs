@@ -158,26 +158,33 @@ impl ChannelStreamBuffer {
 }
 
 /// Check if archive can use the streaming BSC decompression path.
-/// Reads the first 52 bytes of the header to check all flags.
+/// Reads the v2 header prefix + body to check all flags.
 pub(super) fn can_stream_decompress(args: &DecompressConfig) -> Result<bool> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(&args.input)?;
-    let mut header = [0u8; 52];
+    let mut header = [0u8; 60]; // v2 prefix (8) + base body (52)
     if file.read_exact(&mut header).is_err() {
         return Ok(false);
     }
 
-    let encoding_type = header[0];
-    let arithmetic_enabled = header[1] != 0;
-    let quality_compressor = header[3];
-    let sequence_compressor = header[4];
-    let header_compressor = header[5];
-    let quality_model_enabled = header[6] != 0;
-    let quality_delta_enabled = header[7] != 0;
-    let quality_dict_present = header[8] != 0;
-    let template_prefix_len = u16::from_le_bytes([header[9], header[10]]) as usize;
-    let nmasks_len = read_le_u64(&header, 36)?;
+    // Validate v2 magic
+    if header[0..2] != ARCHIVE_MAGIC {
+        anyhow::bail!("Not a QZ archive (missing magic bytes)");
+    }
+
+    let b: usize = V2_PREFIX_SIZE; // body starts after v2 prefix
+    let encoding_type = header[b];
+    let flags = header[b + 1];
+    let arithmetic_enabled = flags & 0x01 != 0;
+    let quality_compressor = header[b + 3];
+    let sequence_compressor = header[b + 4];
+    let header_compressor = header[b + 5];
+    let quality_model_enabled = header[b + 6] != 0;
+    let quality_delta_enabled = header[b + 7] != 0;
+    let quality_dict_present = header[b + 8] != 0;
+    let template_prefix_len = u16::from_le_bytes([header[b + 9], header[b + 10]]) as usize;
+    let nmasks_len = read_le_u64(&header, b + 36)?;
 
     Ok((encoding_type == 0 || encoding_type == 4 || encoding_type == 6) // 0=raw, 4=raw+hints, 6=rc_canon
         && !arithmetic_enabled
@@ -209,29 +216,52 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
     info!("Output files: {:?}", args.output);
     info!("Streaming decompression mode (parallel BSC)");
 
-    // Read archive header (52 bytes for BSC path with no template/model/dict)
+    // Read v2 archive header: prefix (8) + body (52 base, +8 if const-length fields)
     let mut file = std::fs::File::open(&args.input)
         .with_context(|| format!("Failed to open archive: {:?}", args.input))?;
-    let mut header = [0u8; 52];
-    file.read_exact(&mut header)
+    let mut header = [0u8; 68]; // v2 prefix (8) + body (52) + optional const-length (8)
+    file.read_exact(&mut header[..60])
         .context("Failed to read archive header")?;
-    drop(file);
 
-    let encoding_type = header[0];
+    // Validate v2 magic
+    if header[0..2] != ARCHIVE_MAGIC {
+        anyhow::bail!("Not a QZ archive (missing magic bytes)");
+    }
+    let stored_header_size = read_le_u32(&header, 4)? as usize;
+
+    let b: usize = V2_PREFIX_SIZE; // body starts after prefix
+    let encoding_type = header[b];
+    let flags = header[b + 1];
     let has_sequence_hints = encoding_type == 4;
     let has_rc_canon = encoding_type == 6;
-    let quality_binning = code_to_binning(header[2])?;
-    let _has_comment = header[11] != 0;
+    let quality_binning = code_to_binning(header[b + 2])?;
+    let _has_comment = header[b + 11] != 0;
 
-    let num_reads = read_le_u64(&header, 12)? as usize;
-    let headers_len = read_le_u64(&header, 20)? as usize;
-    let sequences_len = read_le_u64(&header, 28)? as usize;
-    let nmasks_len = read_le_u64(&header, 36)? as usize;
-    let qualities_len = read_le_u64(&header, 44)? as usize;
+    let num_reads = read_le_u64(&header, b + 12)? as usize;
+    let headers_len = read_le_u64(&header, b + 20)? as usize;
+    let sequences_len = read_le_u64(&header, b + 28)? as usize;
+    let nmasks_len = read_le_u64(&header, b + 36)? as usize;
+    let qualities_len = read_le_u64(&header, b + 44)? as usize;
+
+    // Read constant-length fields if present
+    let const_length_present = flags & 0x02 != 0;
+    let (const_seq_len, const_qual_len) = if const_length_present {
+        file.read_exact(&mut header[60..68])
+            .context("Failed to read constant-length header fields")?;
+        let sl = read_le_u32(&header, 60)? as usize;
+        let ql = read_le_u32(&header, 64)? as usize;
+        if sl > 0 { info!("Constant sequence length: {} bp", sl); }
+        if ql > 0 { info!("Constant quality length: {} bp", ql); }
+        (sl, ql)
+    } else {
+        (0, 0)
+    };
+    let data_offset = stored_header_size;
+    drop(file);
 
     // For RC canon archives, read the rc_flags_len from after the standard streams
     let (rc_flags_len, rc_flags_offset) = if has_rc_canon {
-        let q_end = 52u64 + headers_len as u64 + sequences_len as u64 + nmasks_len as u64 + qualities_len as u64;
+        let q_end = data_offset as u64 + headers_len as u64 + sequences_len as u64 + nmasks_len as u64 + qualities_len as u64;
         let mut file = std::fs::File::open(&args.input)?;
         use std::io::Seek;
         file.seek(std::io::SeekFrom::Start(q_end))?;
@@ -249,8 +279,7 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
         if has_rc_canon { format!(" rc_flags={}", humanize_bytes(rc_flags_len)) } else { String::new() });
 
     // Compute stream positions in file
-    let data_start = 52u64;
-    let h_offset = data_start;
+    let h_offset = data_offset as u64;
     let s_offset = h_offset + headers_len as u64;
     let q_offset = s_offset + sequences_len as u64 + nmasks_len as u64;
     let has_quality = qualities_len > 0;
@@ -324,8 +353,8 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
             output.write_all(h_buf.read_bytes(h_len)?)?;
             output.write_all(b"\n")?;
 
-            // Sequence: varint(len) [+ hint byte] + raw bytes
-            let s_len = s_buf.read_varint()?;
+            // Sequence: [varint(len)] [+ hint byte] + raw bytes
+            let s_len = if const_seq_len > 0 { const_seq_len } else { s_buf.read_varint()? };
             if has_sequence_hints {
                 s_buf.read_bytes(1)?; // skip hint byte
             }
@@ -345,9 +374,9 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
             }
             output.write_all(b"\n+\n")?;
 
-            // Quality: varint(orig_len) + packed bytes
+            // Quality: [varint(orig_len)] + packed bytes
             if let Some(ref mut q) = q_buf {
-                let q_len = q.read_varint()?;
+                let q_len = if const_qual_len > 0 { const_qual_len } else { q.read_varint()? };
                 let packed_len = (q_len * bits_per_qual + 7) / 8;
                 let packed = q.read_bytes(packed_len)?;
                 columnar::unpack_qualities_to_writer(packed, q_len, quality_binning, &mut output)?;
@@ -373,7 +402,6 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
 struct ArchiveHeader {
     encoding_type: u8,
     arithmetic_enabled: bool,
-    read_lengths_opt: Option<Vec<usize>>,
     quality_binning: QualityBinning,
     quality_compressor: QualityCompressor,
     sequence_compressor: SequenceCompressor,
@@ -389,36 +417,43 @@ struct ArchiveHeader {
     sequences_len: usize,
     nmasks_len: usize,
     qualities_len: usize,
+    /// Constant sequence length (0 = variable, >0 = all sequences this length).
+    const_seq_len: usize,
+    /// Constant quality length (0 = variable, >0 = all qualities this length).
+    const_qual_len: usize,
 }
 
 /// Parse the archive header from raw archive bytes.
 ///
 /// Returns parsed metadata and the byte offset where stream data starts.
 fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
-    if data.len() < 50 {
+    if data.len() < V2_PREFIX_SIZE + 50 {
         anyhow::bail!("Invalid archive: too small");
     }
 
-    let mut offset = 0;
+    // Validate v2 magic
+    if data[0..2] != ARCHIVE_MAGIC {
+        anyhow::bail!("Not a QZ archive (missing magic bytes)");
+    }
+    let _version = data[2];
+    let _stored_header_size = read_le_u32(data, 4)? as usize;
+
+    // Body starts after v2 prefix
+    let mut offset = V2_PREFIX_SIZE;
 
     let encoding_type = data[offset];
     offset += 1;
 
-    let arithmetic_enabled = data[offset] != 0;
+    let flags = data[offset];
     offset += 1;
-    let read_lengths_opt = if arithmetic_enabled {
+    let arithmetic_enabled = flags & 0x01 != 0;
+    let const_length_present = flags & 0x02 != 0;
+    // Skip read lengths if arithmetic mode was used
+    if arithmetic_enabled {
         let num_lengths = read_le_u32(data, offset)? as usize;
         offset += 4;
-        let mut lengths = Vec::with_capacity(num_lengths);
-        for _ in 0..num_lengths {
-            let len = read_le_u32(data, offset)? as usize;
-            offset += 4;
-            lengths.push(len);
-        }
-        Some(lengths)
-    } else {
-        None
-    };
+        offset += num_lengths * 4;
+    }
 
     let quality_binning = code_to_binning(data[offset])?;
     offset += 1;
@@ -509,6 +544,17 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
     let qualities_len = read_le_u64(data, offset)? as usize;
     offset += 8;
 
+    // Read constant-length fields if flags bit 1 is set
+    let (const_seq_len, const_qual_len) = if const_length_present {
+        let sl = read_le_u32(data, offset)? as usize;
+        offset += 4;
+        let ql = read_le_u32(data, offset)? as usize;
+        offset += 4;
+        (sl, ql)
+    } else {
+        (0, 0)
+    };
+
     if data.len() < offset + headers_len + sequences_len + nmasks_len + qualities_len {
         anyhow::bail!("Invalid archive: data truncated");
     }
@@ -516,7 +562,6 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
     Ok(ArchiveHeader {
         encoding_type,
         arithmetic_enabled,
-        read_lengths_opt,
         quality_binning,
         quality_compressor,
         sequence_compressor,
@@ -531,89 +576,13 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         sequences_len,
         nmasks_len,
         qualities_len,
+        const_seq_len,
+        const_qual_len,
     })
 }
 
-/// Decode packed quality data and attach quality strings to records.
-///
-/// Handles all quality encoding variants: quality_delta, fqzcomp, quality_model,
-/// and standard binning mode. Modifies records in place.
-fn decode_qualities_to_records(
-    records: &mut [crate::io::FastqRecord],
-    qualities_data: &[u8],
-    hdr: &ArchiveHeader,
-) -> Result<()> {
-    if qualities_data.is_empty() {
-        return Ok(());
-    }
-
-    if hdr.quality_delta_enabled {
-        let mut encoded_deltas = Vec::new();
-        let mut qual_offset = 0;
-        while qual_offset < qualities_data.len() {
-            let q_len = read_varint(qualities_data, &mut qual_offset)
-                .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
-            if qual_offset + q_len > qualities_data.len() {
-                break;
-            }
-            let deltas = quality_delta::unpack_deltas(&qualities_data[qual_offset..qual_offset + q_len]);
-            qual_offset += q_len;
-            encoded_deltas.push(deltas);
-        }
-        let decoded_qualities = quality_delta::decode_quality_deltas(&encoded_deltas)?;
-        for (i, quality) in decoded_qualities.into_iter().enumerate() {
-            if i < records.len() {
-                records[i].quality = Some(quality);
-            }
-        }
-    } else {
-        let mut qual_offset = 0;
-        for record in records.iter_mut() {
-            if qual_offset >= qualities_data.len() {
-                break;
-            }
-            let q_len = read_varint(qualities_data, &mut qual_offset)
-                .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
-
-            let quality_str = if hdr.quality_compressor == QualityCompressor::Fqzcomp {
-                if qual_offset + q_len <= qualities_data.len() {
-                    let raw = &qualities_data[qual_offset..qual_offset + q_len];
-                    qual_offset += q_len;
-                    unsafe { String::from_utf8_unchecked(raw.to_vec()) }
-                } else {
-                    break;
-                }
-            } else if let Some(ref model) = hdr.quality_model_opt {
-                if qual_offset + q_len <= qualities_data.len() {
-                    let deltas = quality_model::unpack_deltas(&qualities_data[qual_offset..qual_offset + q_len]);
-                    qual_offset += q_len;
-                    quality_model::decode_with_model(&deltas, model)
-                } else {
-                    break;
-                }
-            } else {
-                let bits_per_qual = hdr.quality_binning.bits_per_quality();
-                let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
-                if qual_offset + q_encoded_len <= qualities_data.len() {
-                    let quality_str = columnar::unpack_qualities(
-                        &qualities_data[qual_offset..qual_offset + q_encoded_len],
-                        q_len, hdr.quality_binning,
-                    );
-                    qual_offset += q_encoded_len;
-                    quality_str
-                } else {
-                    break;
-                }
-            };
-            record.quality = Some(quality_str);
-        }
-    }
-
-    Ok(())
-}
-
 pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     let start_time = Instant::now();
 
@@ -625,13 +594,12 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     info!("Input file: {:?}", args.input);
     info!("Output files: {:?}", args.output);
 
-    // Read compressed archive
-    info!("Reading compressed file...");
-    let mut input_file = std::fs::File::open(&args.input)
+    // Memory-map the compressed archive (no allocation, OS pages in on demand)
+    info!("Memory-mapping compressed file...");
+    let input_file = std::fs::File::open(&args.input)
         .with_context(|| format!("Failed to open archive: {:?}", args.input))?;
-    let mut archive_data = Vec::new();
-    input_file.read_to_end(&mut archive_data)
-        .context("Failed to read archive data")?;
+    let archive_data = unsafe { memmap2::Mmap::map(&input_file) }
+        .context("Failed to mmap archive")?;
 
     // Parse archive header
     let hdr = parse_archive_header(&archive_data)?;
@@ -655,183 +623,21 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     let qualities_len = hdr.qualities_len;
     let nmasks_len = hdr.nmasks_len;
     let read_id_template = &hdr.read_id_template;
-    let read_lengths_opt = hdr.read_lengths_opt.clone();
     let quality_model_opt = &hdr.quality_model_opt;
     let quality_dict_opt = &hdr.quality_dict_opt;
+    let const_seq_len = hdr.const_seq_len;
+    let const_qual_len = hdr.const_qual_len;
+    if const_seq_len > 0 { info!("Constant sequence length: {} bp", const_seq_len); }
+    if const_qual_len > 0 { info!("Constant quality length: {} bp", const_qual_len); }
 
     // Decompress based on encoding mode
     info!("Decompressing...");
     let records = if arithmetic_enabled {
-        info!("Decompressing arithmetic-coded data...");
-
-        // Decompress headers
-        let read_ids = decompress_headers_dispatch(
-            header_compressor, headers, template_prefix_len, &read_id_template, num_reads,
-        )?;
-
-        // Decompress sequences with arithmetic coding
-        let read_lengths = read_lengths_opt.ok_or_else(|| anyhow::anyhow!("Arithmetic mode requires read lengths"))?;
-        let decoded_sequences = arithmetic_sequence::decode_sequences_arithmetic(sequences, &read_lengths, num_reads)
-            .context("Failed to decode arithmetic-coded sequences")?;
-
-        // Decompress qualities with arithmetic coding
-        let decoded_qualities = if qualities_len > 0 {
-            let read_length = if !read_lengths.is_empty() { read_lengths[0] } else { 0 };
-            arithmetic_quality::decode_qualities_arithmetic(qualities, &decoded_sequences, read_length, num_reads)
-                .context("Failed to decode arithmetic-coded quality scores")?
-        } else {
-            vec![String::new(); num_reads]
-        };
-
-        // Reconstruct records
-        let mut records = Vec::new();
-        for i in 0..num_reads {
-            let id = read_ids.get(i).cloned().unwrap_or_else(|| format!("@UNKNOWN_{}", i));
-            let seq = decoded_sequences.get(i).cloned().unwrap_or_default();
-            let qual = if qualities_len > 0 {
-                Some(decoded_qualities.get(i).cloned().unwrap_or_default())
-            } else {
-                None
-            };
-            records.push(crate::io::FastqRecord::new(id, seq, qual));
-        }
-
-        records
+        anyhow::bail!("Arithmetic-coded archives are no longer supported (encoding removed)")
     } else if encoding_type == 3 {
-        // De Bruijn graph mode
-        info!("Decompressing de Bruijn graph-coded sequences...");
-
-        // Decompress headers
-        let read_ids = decompress_headers_dispatch(
-            header_compressor, headers, template_prefix_len, &read_id_template, num_reads,
-        )?;
-
-        // Decompress sequences with de Bruijn graph
-        let decoded_sequences = debruijn::decompress_sequences_debruijn(sequences, num_reads)
-            .context("Failed to decompress de Bruijn-coded sequences")?;
-
-        // Decompress qualities
-        let qualities_data = if qualities_len == 0 {
-            Vec::new()
-        } else if let Some(dict) = quality_dict_opt {
-            zstd_dict::decompress_with_dict(qualities, dict)
-                .context("Failed to decompress quality scores (dictionary mode)")?
-        } else {
-            codecs::decompress_qualities_data(qualities, quality_compressor)
-                .context("Failed to decompress quality scores")?
-        };
-
-        // Reconstruct records
-        let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
-            crate::io::FastqRecord::new(id, seq, None)
-        }).collect();
-
-        decode_qualities_to_records(&mut records, &qualities_data, &hdr)?;
-
-        records
+        anyhow::bail!("De Bruijn graph archives are no longer supported (encoding_type=3 removed)")
     } else if encoding_type == 7 {
-        info!("Decompressing factorized sequences (encoding_type=7)...");
-
-        // Detect format version: v2 starts with version byte 0x02,
-        // v1 starts with u64 meta_size whose LSB is always ≥ 32.
-        let is_v2 = !sequences.is_empty() && sequences[0] == 2;
-
-        if is_v2 {
-            // ── Factorize v2: pattern-routed streams ──
-            // Decompress headers + qualities in parallel with sequence decoding
-            let (header_result, qual_result) = rayon::join(
-                || codecs::decompress_headers_bsc(headers, num_reads)
-                    .context("Failed to decompress headers"),
-                || -> Result<Vec<u8>> {
-                    if qualities_len == 0 {
-                        Ok(Vec::new())
-                    } else {
-                        codecs::decompress_qualities_data(qualities, quality_compressor)
-                            .context("Failed to decompress qualities")
-                    }
-                },
-            );
-
-            let read_ids = header_result?;
-            let qualities_data = qual_result?;
-
-            let decoded_sequences = factorize::decode_factorized_sequences_v2(
-                sequences, num_reads)?;
-
-            // Build records
-            let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
-                crate::io::FastqRecord::new(id, seq, None)
-            }).collect();
-
-            decode_qualities_to_records(&mut records, &qualities_data, &hdr)?;
-
-            records
-        } else {
-            // ── Factorize v1: 3 sub-streams (meta, raw_seq, delta_seq) ──
-            let mut soff = 0usize;
-
-            let mut read_sub = |label: &str| -> Result<&[u8]> {
-                if soff + 8 > sequences.len() {
-                    anyhow::bail!("Truncated factorized {} length", label);
-                }
-                let len = read_le_u64(sequences, soff)? as usize;
-                soff += 8;
-                if soff + len > sequences.len() {
-                    anyhow::bail!("Truncated factorized {} data (need {}, have {})", label, len, sequences.len() - soff);
-                }
-                let slice = &sequences[soff..soff + len];
-                soff += len;
-                Ok(slice)
-            };
-
-            let meta_compressed = read_sub("meta")?;
-            let raw_seq_compressed = read_sub("raw_seq")?;
-            let delta_seq_compressed = read_sub("delta_seq")?;
-
-            let ((header_result, qual_result), (meta_result, (raw_seq_result, delta_seq_result))) = rayon::join(
-                || rayon::join(
-                    || codecs::decompress_headers_bsc(headers, num_reads)
-                        .context("Failed to decompress headers"),
-                    || -> Result<Vec<u8>> {
-                        if qualities_len == 0 {
-                            Ok(Vec::new())
-                        } else {
-                            codecs::decompress_qualities_data(qualities, quality_compressor)
-                                .context("Failed to decompress qualities")
-                        }
-                    },
-                ),
-                || rayon::join(
-                    || bsc::decompress_parallel(meta_compressed)
-                        .context("Failed to decompress meta stream"),
-                    || rayon::join(
-                        || bsc::decompress_parallel(raw_seq_compressed)
-                            .context("Failed to decompress raw_seq stream"),
-                        || if delta_seq_compressed.is_empty() { Ok(Vec::new()) }
-                           else { bsc::decompress_parallel(delta_seq_compressed)
-                               .context("Failed to decompress delta_seq stream") },
-                    ),
-                ),
-            );
-
-            let read_ids = header_result?;
-            let meta_data = meta_result?;
-            let raw_seq_data = raw_seq_result?;
-            let delta_seq_data = delta_seq_result?;
-            let qualities_data = qual_result?;
-
-            info!("Reconstructing factorized sequences...");
-            let decoded_sequences = factorize::decode_factorized_sequences(
-                &meta_data, &raw_seq_data, &delta_seq_data, num_reads)?;
-
-            let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
-                crate::io::FastqRecord::new(id, seq, None)
-            }).collect();
-
-            decode_qualities_to_records(&mut records, &qualities_data, &hdr)?;
-
-            records
-        }
+        anyhow::bail!("Factorized archives are no longer supported (encoding_type=7 removed)")
     } else if encoding_type == 8 || encoding_type == 9 {
         // Local reorder + delta (8) or ultra/big-block (9): both store permutation for original order restore
         let mode_name = if encoding_type == 8 { "local-reorder" } else { "ultra" };
@@ -857,7 +663,7 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
         let decoded = seq_result?;
 
         // Decode qualities (may need sequences for quality_ctx)
-        let mut qual_strings: Vec<Option<String>> = vec![None; num_reads];
+        let mut qual_strings: Vec<Option<Vec<u8>>> = vec![None; num_reads];
         if qualities_len > 0 {
             if use_quality_ctx {
                 // Quality_ctx: decompress using sequences as context (in reordered order)
@@ -874,8 +680,12 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                 let mut qual_offset = 0;
                 for i in 0..num_reads {
                     if qual_offset < qualities_data.len() {
-                        let q_len = read_varint(&qualities_data, &mut qual_offset)
-                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length at read {}", i))?;
+                        let q_len = if const_qual_len > 0 {
+                            const_qual_len
+                        } else {
+                            read_varint(&qualities_data, &mut qual_offset)
+                                .ok_or_else(|| anyhow::anyhow!("Failed to read quality length at read {}", i))?
+                        };
                         let bits_per_qual = quality_binning.bits_per_quality();
                         let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
                         if qual_offset + q_encoded_len <= qualities_data.len() {
@@ -908,68 +718,7 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
             .map(|(i, r)| r.ok_or_else(|| anyhow::anyhow!("missing record at index {i} after un-permutation")))
             .collect::<Result<Vec<_>>>()?
     } else if encoding_type == 1 || encoding_type == 2 {
-        // Delta or RLE mode: decompress all streams in parallel
-        let ((header_result, seq_result), qual_result) = rayon::join(
-            || rayon::join(
-                || decompress_headers_dispatch(
-                    header_compressor, headers, template_prefix_len, &read_id_template, num_reads,
-                ),
-                || match sequence_compressor {
-                    SequenceCompressor::Bsc => bsc::decompress_parallel(sequences)
-                        .context("Failed to decompress sequences (BSC)"),
-                    SequenceCompressor::Zstd => decompress_zstd(sequences)
-                        .context("Failed to decompress sequences (zstd)"),
-                    SequenceCompressor::OpenZl => openzl::decompress_parallel(sequences)
-                        .context("Failed to decompress sequences (OpenZL)"),
-                },
-            ),
-            || if let Some(dict) = quality_dict_opt {
-                zstd_dict::decompress_with_dict(qualities, dict)
-                    .context("Failed to decompress quality scores (dictionary mode)")
-            } else {
-                codecs::decompress_qualities_data(qualities, quality_compressor)
-                    .context("Failed to decompress quality scores")
-            },
-        );
-        let read_ids = header_result?;
-        let seq_stream = seq_result?;
-        let quality_stream = qual_result?;
-
-        // Parse encoded sequences
-        let mut encoded_sequences = Vec::new();
-        let mut s_offset = 0;
-        while s_offset + 4 <= seq_stream.len() {
-            let len = read_le_u32(&seq_stream, s_offset)? as usize;
-            s_offset += 4;
-            if s_offset + len > seq_stream.len() {
-                break;
-            }
-            encoded_sequences.push(seq_stream[s_offset..s_offset + len].to_vec());
-            s_offset += len;
-        }
-
-        // Decode sequences
-        let decoded_sequences = if encoding_type == 1 {
-            info!("Decoding delta-encoded sequences...");
-            delta::decode_delta_encoding(&encoded_sequences)?
-        } else {
-            info!("Decoding RLE-encoded sequences...");
-            rle::decode_rle_from_sequences(&encoded_sequences)?
-        };
-
-        // Reconstruct records
-        let mut records = Vec::new();
-        let mut _q_offset = 0;
-
-        for (i, seq) in decoded_sequences.iter().enumerate() {
-            let id = read_ids.get(i).cloned().unwrap_or_else(|| format!("@UNKNOWN_{}", i));
-
-            records.push(crate::io::FastqRecord::new(id, seq.clone(), None));
-        }
-
-        decode_qualities_to_records(&mut records, &quality_stream, &hdr)?;
-
-        records
+        anyhow::bail!("Delta/RLE archives are no longer supported (encoding_type={} removed)", encoding_type)
     } else {
         // Normal mode: decompress all streams in parallel
         info!("Decompressing streams in parallel...");
@@ -982,19 +731,19 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                 header_compressor, headers, template_prefix_len, &read_id_template, num_reads,
             ),
             || rayon::join(
-                || -> Result<Vec<String>> {
+                || -> Result<Vec<Vec<u8>>> {
                     match sequence_compressor {
                         SequenceCompressor::Bsc => {
                             if nmasks_len > 0 {
-                                codecs::decompress_sequences_2bit_bsc(sequences, nmasks, num_reads)
+                                codecs::decompress_sequences_2bit_bsc(sequences, nmasks, num_reads, const_seq_len)
                                     .context("Failed to decompress 2-bit sequences (BSC)")
                             } else {
-                                codecs::decompress_sequences_raw_bsc(sequences, num_reads, encoding_type)
+                                codecs::decompress_sequences_raw_bsc(sequences, num_reads, encoding_type, const_seq_len)
                                     .context("Failed to decompress sequences (BSC)")
                             }
                         }
                         SequenceCompressor::OpenZl => {
-                            codecs::decompress_sequences_raw_openzl(sequences, num_reads)
+                            codecs::decompress_sequences_raw_openzl(sequences, num_reads, const_seq_len)
                                 .context("Failed to decompress sequences (OpenZL)")
                         }
                         SequenceCompressor::Zstd => {
@@ -1078,7 +827,11 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                 let mut encoded_deltas = Vec::new();
                 let mut qual_offset = 0;
                 while qual_offset < qualities_data.len() {
-                    let q_len = read_varint(&qualities_data, &mut qual_offset).ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
+                    let q_len = if const_qual_len > 0 {
+                        const_qual_len
+                    } else {
+                        read_varint(&qualities_data, &mut qual_offset).ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?
+                    };
                     if qual_offset + q_len > qualities_data.len() {
                         break;
                     }
@@ -1101,8 +854,12 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                 let mut qual_offset = 0;
                 for _ in 0..records.len() {
                     if qual_offset >= qualities_data.len() { break; }
-                    let q_len = read_varint(&qualities_data, &mut qual_offset)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?;
+                    let q_len = if const_qual_len > 0 {
+                        const_qual_len
+                    } else {
+                        read_varint(&qualities_data, &mut qual_offset)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?
+                    };
                     let data_len = if quality_compressor == QualityCompressor::Fqzcomp || quality_model_opt.is_some() {
                         q_len
                     } else {
@@ -1114,10 +871,10 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                 }
 
                 // Pass 2: Parallel decode (each record is independent)
-                let decoded_quals: Vec<String> = qual_entries.par_iter().map(|&(data_off, q_len)| {
+                let decoded_quals: Vec<Vec<u8>> = qual_entries.par_iter().map(|&(data_off, q_len)| {
                     if quality_compressor == QualityCompressor::Fqzcomp {
                         let raw = &qualities_data[data_off..data_off + q_len];
-                        unsafe { String::from_utf8_unchecked(raw.to_vec()) }
+                        raw.to_vec()
                     } else if let Some(model) = quality_model_opt {
                         let deltas = quality_model::unpack_deltas(&qualities_data[data_off..data_off + q_len]);
                         quality_model::decode_with_model(&deltas, model)
@@ -1171,12 +928,12 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
         const WRITE_BATCH: usize = 2 * 1024 * 1024;
         let mut buf = Vec::with_capacity(WRITE_BATCH + 1024);
         for record in &records {
-            buf.extend_from_slice(record.id.as_bytes());
+            buf.extend_from_slice(&record.id);
             buf.push(b'\n');
-            buf.extend_from_slice(record.sequence.as_bytes());
+            buf.extend_from_slice(&record.sequence);
             buf.extend_from_slice(b"\n+\n");
             if let Some(qual) = &record.quality {
-                buf.extend_from_slice(qual.as_bytes());
+                buf.extend_from_slice(qual);
             }
             buf.push(b'\n');
             if buf.len() >= WRITE_BATCH {

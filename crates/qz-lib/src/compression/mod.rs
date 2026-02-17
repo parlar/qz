@@ -1,11 +1,9 @@
 mod columnar;
-mod delta;
 mod n_mask;
 mod quality;
 mod quality_delta;
 mod quality_model;
 mod read_id;
-mod rle;
 mod zstd_dict;
 pub mod arithmetic_quality;
 pub mod arithmetic_sequence;
@@ -17,7 +15,6 @@ pub mod greedy_contig;
 pub mod quality_context;
 pub mod openzl;
 pub mod template;
-mod factorize;
 mod ultra;
 pub mod quality_ctx;
 pub mod header_col;
@@ -35,6 +32,13 @@ const DECOMPRESS_BATCH_SIZE: usize = 8;
 
 /// Minimum reads for quality_ctx to outperform BSC (below this, models don't converge)
 const MIN_READS_QUALITY_CTX: usize = 100_000;
+
+/// QZ archive magic bytes (file identification)
+const ARCHIVE_MAGIC: [u8; 2] = *b"QZ";
+/// Current archive format version
+const ARCHIVE_VERSION: u8 = 2;
+/// Size of the v2 prefix: magic(2) + version(1) + reserved(1) + header_size(4)
+const V2_PREFIX_SIZE: usize = 8;
 /// I/O buffer size for reading archive files during decompression
 const IO_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 
@@ -231,110 +235,7 @@ fn encode_sequence_delta(
     Ok(used_delta)
 }
 
-/// Result of reading a chunk of FASTQ records into compression streams.
-struct ChunkStreams {
-    header_stream: Vec<u8>,
-    seq_stream: Vec<u8>,
-    qual_stream: Vec<u8>,
-    rc_flags: Vec<u8>,
-    num_reads: usize,
-    total_bases: usize,
-    original_size: usize,
-    /// Raw quality strings (only populated when collect_strings=true)
-    qual_strings: Vec<String>,
-    /// Raw sequence strings (only populated when collect_strings=true)
-    seq_strings: Vec<String>,
-}
-
-/// Read a chunk of FASTQ records into raw compression streams.
-/// rc_flags is empty unless rc_canon=true, in which case it has 1 byte per read (0=fwd, 1=revcomp).
-/// When collect_strings=true, also keeps raw quality and sequence strings for quality_ctx.
-fn read_chunk_streams<R: std::io::BufRead>(
-    reader: &mut crate::io::FastqReader<R>,
-    chunk_size: usize,
-    quality_mode: QualityMode,
-    quality_binning: QualityBinning,
-    no_quality: bool,
-    sequence_hints: bool,
-    sequence_delta: bool,
-    rc_canon: bool,
-    collect_strings: bool,
-    skip_qual_packing: bool,
-) -> Result<ChunkStreams> {
-    let mut header_stream = Vec::with_capacity(chunk_size * 64);
-    let mut seq_stream = Vec::with_capacity(chunk_size * 152);
-    let mut qual_stream: Vec<u8> = if skip_qual_packing { Vec::new() } else { Vec::with_capacity(chunk_size * 136) };
-    let mut rc_flags: Vec<u8> = if rc_canon { Vec::with_capacity(chunk_size) } else { Vec::new() };
-    let mut qual_strings: Vec<String> = if collect_strings { Vec::with_capacity(chunk_size) } else { Vec::new() };
-    let mut seq_strings: Vec<String> = if collect_strings { Vec::with_capacity(chunk_size) } else { Vec::new() };
-    let mut chunk_reads = 0usize;
-    let mut chunk_bases = 0usize;
-    let mut chunk_orig = 0usize;
-
-    let mut delta_cache = std::collections::HashMap::new();
-    let mut delta_reads = Vec::new();
-
-    for _ in 0..chunk_size {
-        match reader.next()? {
-            Some(record) => {
-                write_varint(&mut header_stream, record.id.len())?;
-                header_stream.extend_from_slice(record.id.as_bytes());
-
-                if sequence_delta {
-                    encode_sequence_delta(record.sequence.as_bytes(), &mut seq_stream, &mut delta_cache, &mut delta_reads)?;
-                } else {
-                    write_varint(&mut seq_stream, record.sequence.len())?;
-                    if sequence_hints {
-                        seq_stream.push(dna_utils::compute_sequence_hint(record.sequence.as_bytes()));
-                    }
-                    if rc_canon {
-                        let (canon_seq, was_reversed) = dna_utils::canonicalize_sequence(record.sequence.as_bytes());
-                        seq_stream.extend_from_slice(&canon_seq);
-                        rc_flags.push(was_reversed as u8);
-                    } else {
-                        seq_stream.extend_from_slice(record.sequence.as_bytes());
-                    }
-                }
-
-                if !no_quality && !skip_qual_packing {
-                    if let Some(ref qual) = record.quality {
-                        let quantized = quality::quantize_quality(qual, quality_mode);
-                        write_varint(&mut qual_stream, quantized.len())?;
-                        let packed = columnar::pack_qualities(&quantized, quality_binning);
-                        qual_stream.extend_from_slice(&packed);
-                    }
-                }
-
-                let seq_len = record.sequence.len();
-                let qual_len = record.quality.as_ref().map(|q| q.len()).unwrap_or(0);
-                chunk_bases += seq_len;
-                chunk_orig += record.id.len() + seq_len + qual_len + 3;
-
-                if collect_strings {
-                    seq_strings.push(record.sequence);
-                    qual_strings.push(record.quality.unwrap_or_default());
-                }
-
-                chunk_reads += 1;
-            }
-            None => break,
-        }
-    }
-
-    Ok(ChunkStreams {
-        header_stream,
-        seq_stream,
-        qual_stream,
-        rc_flags,
-        num_reads: chunk_reads,
-        total_bases: chunk_bases,
-        original_size: chunk_orig,
-        qual_strings,
-        seq_strings,
-    })
-}
-
-/// Read a chunk of FASTQ records into a Vec (for reorder modes that need to sort before streaming).
+/// Read a chunk of FASTQ records into a Vec.
 /// Returns (records, total_bases, original_size).
 fn read_chunk_records<R: std::io::BufRead>(
     reader: &mut crate::io::FastqReader<R>,
@@ -372,6 +273,8 @@ fn records_to_streams(
     sequence_hints: bool,
     sequence_delta: bool,
     rc_canon: bool,
+    const_seq_len: usize,
+    const_qual_len: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let n = records.len();
     let mut header_stream = Vec::with_capacity(n * 64);
@@ -384,28 +287,32 @@ fn records_to_streams(
 
     for record in records {
         write_varint(&mut header_stream, record.id.len())?;
-        header_stream.extend_from_slice(record.id.as_bytes());
+        header_stream.extend_from_slice(&record.id);
 
         if sequence_delta {
-            encode_sequence_delta(record.sequence.as_bytes(), &mut seq_stream, &mut delta_cache, &mut delta_reads)?;
+            encode_sequence_delta(&record.sequence, &mut seq_stream, &mut delta_cache, &mut delta_reads)?;
         } else {
-            write_varint(&mut seq_stream, record.sequence.len())?;
+            if const_seq_len == 0 {
+                write_varint(&mut seq_stream, record.sequence.len())?;
+            }
             if sequence_hints {
-                seq_stream.push(dna_utils::compute_sequence_hint(record.sequence.as_bytes()));
+                seq_stream.push(dna_utils::compute_sequence_hint(&record.sequence));
             }
             if rc_canon {
-                let (canon_seq, was_reversed) = dna_utils::canonicalize_sequence(record.sequence.as_bytes());
+                let (canon_seq, was_reversed) = dna_utils::canonicalize_sequence(&record.sequence);
                 seq_stream.extend_from_slice(&canon_seq);
                 rc_flags.push(was_reversed as u8);
             } else {
-                seq_stream.extend_from_slice(record.sequence.as_bytes());
+                seq_stream.extend_from_slice(&record.sequence);
             }
         }
 
         if !no_quality {
             if let Some(ref qual) = record.quality {
                 let quantized = quality::quantize_quality(qual, quality_mode);
-                write_varint(&mut qual_stream, quantized.len())?;
+                if const_qual_len == 0 {
+                    write_varint(&mut qual_stream, quantized.len())?;
+                }
                 let packed = columnar::pack_qualities(&quantized, quality_binning);
                 qual_stream.extend_from_slice(&packed);
             }
@@ -415,14 +322,43 @@ fn records_to_streams(
     Ok((header_stream, seq_stream, qual_stream, rc_flags))
 }
 
+/// Detect constant sequence/quality lengths from a set of records.
+/// Returns (const_seq_len, const_qual_len) where 0 means variable lengths.
+fn detect_const_lengths(records: &[crate::io::FastqRecord], no_quality: bool) -> (usize, usize) {
+    if records.is_empty() {
+        return (0, 0);
+    }
+    let first_seq_len = records[0].sequence.len();
+    let const_seq_len = if records.iter().all(|r| r.sequence.len() == first_seq_len) {
+        first_seq_len
+    } else {
+        0
+    };
+    let const_qual_len = if !no_quality {
+        if let Some(ref q) = records[0].quality {
+            let first_qual_len = q.len();
+            if records.iter().all(|r| r.quality.as_ref().is_some_and(|q| q.len() == first_qual_len)) {
+                first_qual_len
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    (const_seq_len, const_qual_len)
+}
+
 /// Sort records by reorder sort key, returning a new sorted Vec.
 fn sort_records_by_key(records: Vec<crate::io::FastqRecord>) -> Vec<crate::io::FastqRecord> {
     use rayon::prelude::*;
     let keys: Vec<u128> = records
         .par_iter()
         .map(|r| {
-            let qual_bytes = r.quality.as_ref().map(|q| q.as_bytes()).unwrap_or(&[]);
-            dna_utils::reorder_sort_key(r.sequence.as_bytes(), qual_bytes)
+            let qual_bytes = r.quality.as_ref().map(|q| q.as_slice()).unwrap_or(&[]);
+            dna_utils::reorder_sort_key(&r.sequence, qual_bytes)
         })
         .collect();
     let mut keyed: Vec<(u128, crate::io::FastqRecord)> = keys.into_iter()
@@ -488,6 +424,86 @@ fn write_blocks_to_tmp(blocks: Vec<Vec<u8>>, tmp: &mut std::io::BufWriter<std::f
     Ok(count)
 }
 
+/// Write the chunked archive header (shared by all chunked compression paths).
+/// Returns the metadata size in bytes (including v2 prefix).
+fn write_archive_header(
+    out: &mut impl std::io::Write,
+    encoding_type: u8,
+    quality_binning: QualityBinning,
+    quality_compressor: QualityCompressor,
+    no_quality: bool,
+    num_reads: usize,
+    headers_len: usize,
+    sequences_len: usize,
+    qualities_len: usize,
+    const_seq_len: usize,
+    const_qual_len: usize,
+    rc_flags_len: usize,
+) -> Result<usize> {
+    let has_const_lengths = const_seq_len > 0 || const_qual_len > 0;
+    let flags: u8 = if has_const_lengths { 0x02 } else { 0x00 };
+    let const_len_size = if has_const_lengths { 8 } else { 0 };
+    let body_size: usize = 9 + 2 + 1 + 40 + const_len_size;
+    let header_size = V2_PREFIX_SIZE + body_size;
+
+    // v2 prefix: magic + version + reserved + header_size
+    out.write_all(&ARCHIVE_MAGIC)?;
+    out.write_all(&[ARCHIVE_VERSION, 0])?;
+    out.write_all(&(header_size as u32).to_le_bytes())?;
+
+    // Header body (unchanged layout)
+    out.write_all(&[encoding_type])?;
+    out.write_all(&[flags])?;
+    out.write_all(&[binning_to_code(quality_binning)])?;
+    out.write_all(&[compressor_to_code(quality_compressor)])?;
+    out.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?;
+    out.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;
+    out.write_all(&[0u8])?;                          // quality_model = disabled
+    out.write_all(&[0u8])?;                          // quality_delta = disabled
+    out.write_all(&[0u8])?;                          // quality_dict = disabled
+    out.write_all(&0u16.to_le_bytes())?;             // template_prefix_len = 0
+    out.write_all(&[0u8])?;                          // has_comment = false
+
+    out.write_all(&(num_reads as u64).to_le_bytes())?;
+    out.write_all(&(headers_len as u64).to_le_bytes())?;
+    out.write_all(&(sequences_len as u64).to_le_bytes())?;
+    out.write_all(&0u64.to_le_bytes())?;             // nmasks_len = 0
+    out.write_all(&(if no_quality { 0 } else { qualities_len } as u64).to_le_bytes())?;
+
+    if has_const_lengths {
+        out.write_all(&(const_seq_len as u32).to_le_bytes())?;
+        out.write_all(&(const_qual_len as u32).to_le_bytes())?;
+    }
+
+    let has_rc = rc_flags_len > 0;
+    Ok(header_size + if has_rc { 8 } else { 0 })
+}
+
+/// Log compression stats.
+fn log_compression_stats(
+    original_size: usize,
+    headers_len: usize,
+    sequences_len: usize,
+    qualities_len: usize,
+    rc_flags_len: usize,
+    metadata_size: usize,
+    elapsed: std::time::Duration,
+) {
+    let total_compressed = headers_len + sequences_len + qualities_len + rc_flags_len + metadata_size;
+    info!("Compression completed in {:.2}s", elapsed.as_secs_f64());
+    info!("Original size: {} bytes", original_size);
+    info!("Compressed size: {} bytes", total_compressed);
+    info!("Compression ratio: {:.2}x", original_size as f64 / total_compressed as f64);
+    info!("Stream breakdown:");
+    info!("  Headers:   {} bytes ({:.1}%)", headers_len, 100.0 * headers_len as f64 / total_compressed as f64);
+    info!("  Sequences: {} bytes ({:.1}%)", sequences_len, 100.0 * sequences_len as f64 / total_compressed as f64);
+    info!("  Qualities: {} bytes ({:.1}%)", qualities_len, 100.0 * qualities_len as f64 / total_compressed as f64);
+    if rc_flags_len > 0 {
+        info!("  RC flags:  {} bytes ({:.1}%)", rc_flags_len, 100.0 * rc_flags_len as f64 / total_compressed as f64);
+    }
+    info!("  Metadata:  {} bytes ({:.1}%)", metadata_size, 100.0 * metadata_size as f64 / total_compressed as f64);
+}
+
 /// Optional RC (reverse-complement) flags stream appended after qualities.
 struct RcStreamParams<'a> {
     flags_len: usize,
@@ -495,7 +511,7 @@ struct RcStreamParams<'a> {
     tmp_path: &'a std::path::Path,
 }
 
-/// Write the final archive from temp files (shared by all chunked compression paths).
+/// Write the final archive from temp files (shared by reorder and global-reorder paths).
 fn write_chunked_archive(
     output_path: &std::path::Path,
     quality_binning: QualityBinning,
@@ -515,29 +531,20 @@ fn write_chunked_archive(
     original_size: usize,
     start_time: Instant,
     rc_stream: Option<RcStreamParams<'_>>,
+    const_seq_len: usize,
+    const_qual_len: usize,
 ) -> Result<()> {
     use std::io::{Write, BufReader};
 
     info!("Writing output file...");
     let mut output_file = std::fs::File::create(output_path)?;
 
-    output_file.write_all(&[encoding_type])?;                                    // encoding_type
-    output_file.write_all(&[0u8])?;                                             // arithmetic = disabled
-    output_file.write_all(&[binning_to_code(quality_binning)])?;                // quality_binning
-    output_file.write_all(&[compressor_to_code(quality_compressor)])?;           // quality_compressor
-    output_file.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?; // seq_compressor
-    output_file.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;// header_compressor
-    output_file.write_all(&[0u8])?;                                             // quality_model = disabled
-    output_file.write_all(&[0u8])?;                                             // quality_delta = disabled
-    output_file.write_all(&[0u8])?;                                             // quality_dict = disabled
-    output_file.write_all(&0u16.to_le_bytes())?;                                // template_prefix_len = 0
-    output_file.write_all(&[0u8])?;                                             // has_comment = false
-
-    output_file.write_all(&(num_reads as u64).to_le_bytes())?;
-    output_file.write_all(&(headers_len as u64).to_le_bytes())?;
-    output_file.write_all(&(sequences_len as u64).to_le_bytes())?;
-    output_file.write_all(&0u64.to_le_bytes())?;                                // nmasks_len = 0
-    output_file.write_all(&(if no_quality { 0 } else { qualities_len } as u64).to_le_bytes())?;
+    let rc_flags_len = rc_stream.as_ref().map(|rc| rc.flags_len).unwrap_or(0);
+    let metadata_size = write_archive_header(
+        &mut output_file, encoding_type, quality_binning, quality_compressor,
+        no_quality, num_reads, headers_len, sequences_len, qualities_len,
+        const_seq_len, const_qual_len, rc_flags_len,
+    )?;
 
     let copy_stream = |num_blocks: u32, tmp_path: &std::path::Path, out: &mut std::fs::File| -> Result<()> {
         if num_blocks == 0 { return Ok(()); }
@@ -552,33 +559,14 @@ fn write_chunked_archive(
     copy_stream(q_num_blocks, q_tmp_path, &mut output_file)?;
 
     // Append RC flags stream after qualities (encoding_type=6 signals its presence)
-    let rc_flags_len = if let Some(ref rc) = rc_stream {
+    if let Some(ref rc) = rc_stream {
         if rc.num_blocks > 0 {
             output_file.write_all(&(rc.flags_len as u64).to_le_bytes())?;
             copy_stream(rc.num_blocks, rc.tmp_path, &mut output_file)?;
         }
-        rc.flags_len
-    } else {
-        0
-    };
-
-    let has_rc = rc_stream.as_ref().is_some_and(|rc| rc.num_blocks > 0);
-    let metadata_size = 9 + 2 + 1 + 40 + if has_rc { 8 } else { 0 };
-    let total_compressed = headers_len + sequences_len + qualities_len + rc_flags_len + metadata_size;
-
-    let elapsed = start_time.elapsed();
-    info!("Compression completed in {:.2}s", elapsed.as_secs_f64());
-    info!("Original size: {} bytes", original_size);
-    info!("Compressed size: {} bytes", total_compressed);
-    info!("Compression ratio: {:.2}x", original_size as f64 / total_compressed as f64);
-    info!("Stream breakdown:");
-    info!("  Headers:   {} bytes ({:.1}%)", headers_len, 100.0 * headers_len as f64 / total_compressed as f64);
-    info!("  Sequences: {} bytes ({:.1}%)", sequences_len, 100.0 * sequences_len as f64 / total_compressed as f64);
-    info!("  Qualities: {} bytes ({:.1}%)", qualities_len, 100.0 * qualities_len as f64 / total_compressed as f64);
-    if rc_flags_len > 0 {
-        info!("  RC flags:  {} bytes ({:.1}%)", rc_flags_len, 100.0 * rc_flags_len as f64 / total_compressed as f64);
     }
-    info!("  Metadata:  {} bytes ({:.1}%)", metadata_size, 100.0 * metadata_size as f64 / total_compressed as f64);
+
+    log_compression_stats(original_size, headers_len, sequences_len, qualities_len, rc_flags_len, metadata_size, start_time.elapsed());
 
     Ok(())
 }
@@ -591,14 +579,15 @@ fn decompress_headers_dispatch(
     template_prefix_len: usize,
     read_id_template: &read_id::ReadIdTemplate,
     num_reads: usize,
-) -> Result<Vec<String>> {
+) -> Result<Vec<Vec<u8>>> {
     match header_compressor {
         HeaderCompressor::Bsc => {
             if template_prefix_len > 0 {
                 let header_data = bsc::decompress_parallel(headers)
                     .context("Failed to decompress headers (BSC)")?;
-                read_id::decode_read_ids(&header_data, read_id_template, num_reads)
-                    .context("Failed to decode template-encoded read IDs")
+                let strings = read_id::decode_read_ids(&header_data, read_id_template, num_reads)
+                    .context("Failed to decode template-encoded read IDs")?;
+                Ok(strings.into_iter().map(String::into_bytes).collect())
             } else {
                 codecs::decompress_headers_bsc(headers, num_reads)
                     .context("Failed to decompress headers (BSC)")
@@ -607,15 +596,17 @@ fn decompress_headers_dispatch(
         HeaderCompressor::Zstd => {
             let header_data = decompress_zstd(headers)
                 .context("Failed to decompress headers (zstd)")?;
-            read_id::decode_read_ids(&header_data, read_id_template, num_reads)
-                .context("Failed to decode read IDs")
+            let strings = read_id::decode_read_ids(&header_data, read_id_template, num_reads)
+                .context("Failed to decode read IDs")?;
+            Ok(strings.into_iter().map(String::into_bytes).collect())
         }
         HeaderCompressor::OpenZl => {
             if template_prefix_len > 0 {
                 let header_data = openzl::decompress_parallel(headers)
                     .context("Failed to decompress headers (OpenZL)")?;
-                read_id::decode_read_ids(&header_data, read_id_template, num_reads)
-                    .context("Failed to decode template-encoded read IDs")
+                let strings = read_id::decode_read_ids(&header_data, read_id_template, num_reads)
+                    .context("Failed to decode template-encoded read IDs")?;
+                Ok(strings.into_iter().map(String::into_bytes).collect())
             } else {
                 codecs::decompress_headers_openzl(headers, num_reads)
                     .context("Failed to decompress headers (OpenZL)")

@@ -1,4 +1,4 @@
-use qz_lib::cli::{CompressConfig, DecompressConfig, HeaderCompressor, QualityCompressor, QualityMode, ReorderMode, SequenceCompressor};
+use qz_lib::cli::{AdvancedOptions, CompressConfig, DecompressConfig, HeaderCompressor, QualityCompressor, QualityMode, ReorderMode, SequenceCompressor};
 use std::fs;
 use tempfile::TempDir;
 
@@ -156,9 +156,12 @@ fn test_decompress_no_quality() {
         working_dir: temp_path.clone(),
         threads: 1,
         no_quality: true,
-        quality_compressor: QualityCompressor::Zstd,
-        sequence_compressor: SequenceCompressor::Zstd,
-        header_compressor: HeaderCompressor::Zstd,
+        advanced: AdvancedOptions {
+            quality_compressor: QualityCompressor::Zstd,
+            sequence_compressor: SequenceCompressor::Zstd,
+            header_compressor: HeaderCompressor::Zstd,
+            ..Default::default()
+        },
         ..CompressConfig::default()
     };
     qz_lib::compression::compress(&compress_args).unwrap();
@@ -370,7 +373,10 @@ fn test_different_compression_levels() {
             output: archive_path.clone(),
             working_dir: temp_path.clone(),
             threads: 1,
-            compression_level: level,
+            advanced: AdvancedOptions {
+                compression_level: level,
+                ..Default::default()
+            },
             ..CompressConfig::default()
         };
 
@@ -532,7 +538,7 @@ fn test_twobit_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        twobit: true,
+        advanced: AdvancedOptions { twobit: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -564,7 +570,7 @@ fn test_header_template_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        header_template: true,
+        advanced: AdvancedOptions { header_template: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -593,7 +599,7 @@ fn test_quality_modeling_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        quality_modeling: true,
+        advanced: AdvancedOptions { quality_modeling: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -637,9 +643,12 @@ fn test_openzl_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        quality_compressor: QualityCompressor::OpenZl,
-        sequence_compressor: SequenceCompressor::OpenZl,
-        header_compressor: HeaderCompressor::OpenZl,
+        advanced: AdvancedOptions {
+            quality_compressor: QualityCompressor::OpenZl,
+            sequence_compressor: SequenceCompressor::OpenZl,
+            header_compressor: HeaderCompressor::OpenZl,
+            ..Default::default()
+        },
         ..CompressConfig::default()
     };
 
@@ -684,7 +693,7 @@ fn test_fqzcomp_quality_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        quality_compressor: QualityCompressor::Fqzcomp,
+        advanced: AdvancedOptions { quality_compressor: QualityCompressor::Fqzcomp, ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -726,9 +735,12 @@ fn test_openzl_mixed_compressors() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        quality_compressor: QualityCompressor::OpenZl,
-        sequence_compressor: SequenceCompressor::Bsc,
-        header_compressor: HeaderCompressor::OpenZl,
+        advanced: AdvancedOptions {
+            quality_compressor: QualityCompressor::OpenZl,
+            sequence_compressor: SequenceCompressor::Bsc,
+            header_compressor: HeaderCompressor::OpenZl,
+            ..Default::default()
+        },
         ..CompressConfig::default()
     };
 
@@ -772,7 +784,7 @@ fn test_reorder_local_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        reorder: Some(ReorderMode::Local),
+        advanced: AdvancedOptions { reorder: Some(ReorderMode::Local), ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -818,7 +830,7 @@ fn test_reorder_global_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        reorder: Some(ReorderMode::Global),
+        advanced: AdvancedOptions { reorder: Some(ReorderMode::Global), ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -864,16 +876,16 @@ fn test_sequence_hints_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        sequence_hints: true,
+        advanced: AdvancedOptions { sequence_hints: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
     qz_lib::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Verify encoding_type byte is 4
+    // Verify encoding_type byte is 4 (at offset 8, after v2 prefix)
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[0], 4, "encoding_type should be 4 for sequence hints");
+    assert_eq!(archive_data[8], 4, "encoding_type should be 4 for sequence hints");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -913,16 +925,16 @@ fn test_sequence_delta_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        sequence_delta: true,
+        advanced: AdvancedOptions { sequence_delta: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
     qz_lib::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Verify encoding_type byte is 5
+    // Verify encoding_type byte is 5 (at offset 8, after v2 prefix)
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[0], 5, "encoding_type should be 5 for inline delta");
+    assert_eq!(archive_data[8], 5, "encoding_type should be 5 for inline delta");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -960,65 +972,16 @@ fn test_rc_canon_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        rc_canon: true,
+        advanced: AdvancedOptions { rc_canon: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
     qz_lib::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Verify encoding_type byte is 6
+    // Verify encoding_type byte is 6 (at offset 8, after v2 prefix)
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[0], 6, "encoding_type should be 6 for rc_canon");
-
-    let output_fastq = temp_path.join("decompressed.fastq");
-    qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
-
-    assert!(output_fastq.exists());
-
-    let original = fs::read_to_string(&input_fastq).unwrap();
-    let decompressed = fs::read_to_string(&output_fastq).unwrap();
-
-    let orig_lines: Vec<&str> = original.lines().collect();
-    let decomp_lines: Vec<&str> = decompressed.lines().collect();
-    assert_eq!(orig_lines.len(), decomp_lines.len(), "line count mismatch");
-    for (i, (orig, decomp)) in orig_lines.iter().zip(decomp_lines.iter()).enumerate() {
-        assert_eq!(orig.trim(), decomp.trim(), "mismatch at line {}", i);
-    }
-}
-
-#[test]
-fn test_factorize_roundtrip() {
-    let temp_dir = TempDir::new().unwrap();
-    let temp_path = temp_dir.path().to_path_buf();
-
-    let input_fastq = temp_path.join("test_input.fastq");
-    // Include near-duplicate reads to exercise the factorize match path
-    let test_data = "\
-@read1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
-@read2\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n\
-@read3\nACGTACGTACGTACGTACGTACGTATGTACGT\n+\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
-@read4\nTGCATGCATGCATGCATGCATGCATGCATGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
-@read5\nAAAACCCCGGGGTTTTAAAACCCCGGGGTTTT\n+\nDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\n\
-@read6\nACGT\n+\nIIII\n";
-    fs::write(&input_fastq, test_data).unwrap();
-
-    let archive_path = temp_path.join("test.qz");
-    let compress_args = CompressConfig {
-        input: vec![input_fastq.clone()],
-        output: archive_path.clone(),
-        working_dir: temp_path.clone(),
-        threads: 1,
-        factorize: true,
-        ..CompressConfig::default()
-    };
-
-    qz_lib::compression::compress(&compress_args).unwrap();
-    assert!(archive_path.exists());
-
-    // Verify encoding_type byte is 7
-    let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[0], 7, "encoding_type should be 7 for factorize");
+    assert_eq!(archive_data[8], 6, "encoding_type should be 6 for rc_canon");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -1057,7 +1020,7 @@ fn test_local_reorder_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        local_reorder: true,
+        advanced: AdvancedOptions { local_reorder: true, ..Default::default() },
         ..CompressConfig::default()
     };
 
@@ -1065,7 +1028,7 @@ fn test_local_reorder_roundtrip() {
     assert!(archive_path.exists());
 
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[0], 8, "encoding_type should be 8 for local-reorder");
+    assert_eq!(archive_data[8], 8, "encoding_type should be 8 for local-reorder");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -1111,7 +1074,7 @@ fn test_ultra_roundtrip() {
     assert!(archive_path.exists());
 
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[0], 9, "encoding_type should be 9 for ultra");
+    assert_eq!(archive_data[8], 9, "encoding_type should be 9 for ultra");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -1155,16 +1118,16 @@ fn test_quality_ctx_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        quality_compressor: QualityCompressor::QualityCtx,
+        advanced: AdvancedOptions { quality_compressor: QualityCompressor::QualityCtx, ..Default::default() },
         ..CompressConfig::default()
     };
 
     qz_lib::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Verify archive header has quality_compressor = 4 (QualityCtx)
+    // Verify archive header has quality_compressor = 4 (QualityCtx), at offset 11 after v2 prefix
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[3], 4, "quality_compressor code should be 4 (QualityCtx)");
+    assert_eq!(archive_data[11], 4, "quality_compressor code should be 4 (QualityCtx)");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -1203,16 +1166,16 @@ fn test_quality_ctx_variable_length_roundtrip() {
         output: archive_path.clone(),
         working_dir: temp_path.clone(),
         threads: 1,
-        quality_compressor: QualityCompressor::QualityCtx,
+        advanced: AdvancedOptions { quality_compressor: QualityCompressor::QualityCtx, ..Default::default() },
         ..CompressConfig::default()
     };
 
     qz_lib::compression::compress(&compress_args).unwrap();
     assert!(archive_path.exists());
 
-    // Verify archive uses QualityCtx (not fallen back to BSC)
+    // Verify archive uses QualityCtx (not fallen back to BSC), at offset 11 after v2 prefix
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[3], 4, "quality_compressor should be 4 (QualityCtx), not BSC fallback");
+    assert_eq!(archive_data[11], 4, "quality_compressor should be 4 (QualityCtx), not BSC fallback");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -1229,57 +1192,13 @@ fn test_quality_ctx_variable_length_roundtrip() {
 }
 
 // ========================================
-// ENCODING TYPE ROUNDTRIP TESTS
-// ========================================
-
-#[test]
-fn test_delta_encoding_roundtrip() {
-    roundtrip_exact(MULTI_READ_DATA, |c| {
-        c.delta_encoding = true;
-        c.sequence_compressor = SequenceCompressor::Zstd;
-        c.quality_compressor = QualityCompressor::Zstd;
-        c.header_compressor = HeaderCompressor::Zstd;
-    });
-}
-
-#[test]
-fn test_rle_encoding_roundtrip() {
-    roundtrip_exact(MULTI_READ_DATA, |c| {
-        c.rle_encoding = true;
-        c.sequence_compressor = SequenceCompressor::Zstd;
-        c.quality_compressor = QualityCompressor::Zstd;
-        c.header_compressor = HeaderCompressor::Zstd;
-    });
-}
-
-#[test]
-fn test_arithmetic_roundtrip() {
-    roundtrip_exact(MULTI_READ_DATA, |c| {
-        c.arithmetic = true;
-        c.sequence_compressor = SequenceCompressor::Zstd;
-        c.quality_compressor = QualityCompressor::Zstd;
-        c.header_compressor = HeaderCompressor::Zstd;
-    });
-}
-
-#[test]
-fn test_debruijn_roundtrip() {
-    roundtrip_exact(MULTI_READ_DATA, |c| {
-        c.debruijn = true;
-        c.sequence_compressor = SequenceCompressor::Zstd;
-        c.quality_compressor = QualityCompressor::Zstd;
-        c.header_compressor = HeaderCompressor::Zstd;
-    });
-}
-
-// ========================================
 // BSC STATIC MODE TEST
 // ========================================
 
 #[test]
 fn test_bsc_static_roundtrip() {
     roundtrip_exact(MULTI_READ_DATA, |c| {
-        c.bsc_static = true;
+        c.advanced.bsc_static = true;
     });
 }
 
@@ -1290,10 +1209,10 @@ fn test_bsc_static_roundtrip() {
 #[test]
 fn test_quality_delta_roundtrip() {
     roundtrip_exact(MULTI_READ_DATA, |c| {
-        c.quality_delta = true;
-        c.sequence_compressor = SequenceCompressor::Zstd;
-        c.quality_compressor = QualityCompressor::Zstd;
-        c.header_compressor = HeaderCompressor::Zstd;
+        c.advanced.quality_delta = true;
+        c.advanced.sequence_compressor = SequenceCompressor::Zstd;
+        c.advanced.quality_compressor = QualityCompressor::Zstd;
+        c.advanced.header_compressor = HeaderCompressor::Zstd;
     });
 }
 
@@ -1307,11 +1226,11 @@ fn test_dict_training_roundtrip() {
         ));
     }
     roundtrip_exact(&data, |c| {
-        c.dict_training = true;
-        c.dict_size = 32;
-        c.sequence_compressor = SequenceCompressor::Zstd;
-        c.quality_compressor = QualityCompressor::Zstd;
-        c.header_compressor = HeaderCompressor::Zstd;
+        c.advanced.dict_training = true;
+        c.advanced.dict_size = 32;
+        c.advanced.sequence_compressor = SequenceCompressor::Zstd;
+        c.advanced.quality_compressor = QualityCompressor::Zstd;
+        c.advanced.header_compressor = HeaderCompressor::Zstd;
     });
 }
 
@@ -1337,9 +1256,9 @@ fn test_decompress_invalid_compressor_codes() {
     };
     qz_lib::compression::compress(&compress_args).unwrap();
 
-    // Byte 3 is quality_compressor code -- set to invalid 99
+    // Byte 11 is quality_compressor code (offset 3 in body, after 8-byte v2 prefix) -- set to invalid 99
     let mut data = fs::read(&archive_path).unwrap();
-    data[3] = 99;
+    data[11] = 99;
     let bad_path = temp_path.join("bad.qz");
     fs::write(&bad_path, &data).unwrap();
 

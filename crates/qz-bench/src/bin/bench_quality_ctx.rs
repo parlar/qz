@@ -21,8 +21,8 @@ fn main() {
     println!("Loading reads from {}...", path);
     let t0 = Instant::now();
     let mut reader = FastqReader::from_path(path, false).expect("Failed to open FASTQ");
-    let mut sequences: Vec<String> = Vec::new();
-    let mut qualities: Vec<String> = Vec::new();
+    let mut sequences: Vec<Vec<u8>> = Vec::new();
+    let mut qualities: Vec<Vec<u8>> = Vec::new();
 
     while let Some(rec) = reader.next().expect("read error") {
         sequences.push(rec.sequence);
@@ -42,14 +42,14 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    let seq_refs: Vec<&str> = sequences.iter().map(|s| s.as_str()).collect();
-    let qual_refs: Vec<&str> = qualities.iter().map(|s| s.as_str()).collect();
+    let seq_refs: Vec<&[u8]> = sequences.iter().map(|s| s.as_slice()).collect();
+    let qual_refs: Vec<&[u8]> = qualities.iter().map(|s| s.as_slice()).collect();
 
     // ================================================================
     // BSC baseline
     // ================================================================
     println!("=== BSC Compression ===");
-    let qual_concat: Vec<u8> = qualities.iter().flat_map(|q| q.bytes()).collect();
+    let qual_concat: Vec<u8> = qualities.iter().flat_map(|q| q.iter().copied()).collect();
     let t0 = Instant::now();
     let bsc_compressed = bsc::compress_parallel_adaptive(&qual_concat).expect("BSC compress failed");
     let bsc_time = t0.elapsed().as_secs_f64();

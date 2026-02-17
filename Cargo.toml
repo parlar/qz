@@ -37,4 +37,5 @@ clap = { version = "4.5", features = ["derive"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tempfile = "3.13"
 cc = "1.0"
+memmap2 = "0.9"
 qz-lib = { path = "crates/qz-lib" }

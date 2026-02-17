@@ -3,17 +3,22 @@ use flate2::read::GzDecoder;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-/// A single FASTQ record
+/// A single FASTQ record with byte-oriented fields.
+///
+/// Fields are stored as `Vec<u8>` rather than `String` because FASTQ data is
+/// ASCII and most operations work on raw bytes (compression, hashing, output).
+/// This avoids unnecessary UTF-8 validation when constructing records from
+/// decompressed byte streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastqRecord {
-    pub id: String,
-    pub sequence: String,
-    pub quality: Option<String>,
+    pub id: Vec<u8>,
+    pub sequence: Vec<u8>,
+    pub quality: Option<Vec<u8>>,
 }
 
 impl FastqRecord {
     /// Create a new FASTQ record
-    pub fn new(id: String, sequence: String, quality: Option<String>) -> Self {
+    pub fn new(id: Vec<u8>, sequence: Vec<u8>, quality: Option<Vec<u8>>) -> Self {
         Self { id, sequence, quality }
     }
 }
@@ -63,7 +68,7 @@ impl FastqReader<FileReader> {
             .with_context(|| format!("Failed to open file: {:?}", path.as_ref()))?;
 
         // Check if file is gzipped by reading magic bytes
-        let mut buffered = BufReader::new(file);
+        let mut buffered = BufReader::with_capacity(4 * 1024 * 1024, file);
         let is_gzipped = {
             let peek = buffered.fill_buf()?;
             peek.len() >= 2 && peek[0] == 0x1f && peek[1] == 0x8b
@@ -99,13 +104,13 @@ impl<R: BufRead> FastqReader<R> {
             return Ok(None); // EOF
         }
 
-        let id = self.buffer.trim_end().to_string();
+        let id = self.buffer.trim_end().as_bytes().to_vec();
 
         // Read sequence line
         self.buffer.clear();
         self.reader.read_line(&mut self.buffer)
             .context("Invalid FASTQ: missing sequence line")?;
-        let sequence = self.buffer.trim_end().to_string();
+        let sequence = self.buffer.trim_end().as_bytes().to_vec();
 
         if self.is_fasta {
             return Ok(Some(FastqRecord::new(id, sequence, None)));
@@ -133,7 +138,7 @@ impl<R: BufRead> FastqReader<R> {
         if qual_bytes == 0 {
             anyhow::bail!("Invalid FASTQ: unexpected EOF at quality line");
         }
-        let quality = self.buffer.trim_end().to_string();
+        let quality = self.buffer.trim_end().as_bytes().to_vec();
 
         // Validate sequence and quality lengths match
         if quality.len() != sequence.len() {
@@ -141,7 +146,7 @@ impl<R: BufRead> FastqReader<R> {
                 "Invalid FASTQ: sequence length ({}) != quality length ({}) for read {}",
                 sequence.len(),
                 quality.len(),
-                id
+                String::from_utf8_lossy(&id)
             );
         }
 
@@ -162,12 +167,12 @@ mod tests {
         let mut reader = FastqReader::new(cursor, false);
 
         let record1 = reader.next().unwrap().unwrap();
-        assert_eq!(record1.id, "@read1");
-        assert_eq!(record1.sequence, "ACGT");
-        assert_eq!(record1.quality, Some("IIII".to_string()));
+        assert_eq!(record1.id, b"@read1");
+        assert_eq!(record1.sequence, b"ACGT");
+        assert_eq!(record1.quality, Some(b"IIII".to_vec()));
 
         let record2 = reader.next().unwrap().unwrap();
-        assert_eq!(record2.id, "@read2");
+        assert_eq!(record2.id, b"@read2");
         assert!(reader.next().unwrap().is_none());
     }
 
@@ -204,8 +209,8 @@ mod tests {
         let mut reader = FastqReader::new(cursor, true);
 
         let record1 = reader.next().unwrap().unwrap();
-        assert_eq!(record1.id, ">seq1");
-        assert_eq!(record1.sequence, "ACGT");
+        assert_eq!(record1.id, b">seq1");
+        assert_eq!(record1.sequence, b"ACGT");
         assert!(record1.quality.is_none());
     }
 }
