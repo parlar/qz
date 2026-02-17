@@ -206,14 +206,26 @@ compression::compress(&config)?;
 ```
 qz/
 ├── Cargo.toml                     workspace root
-├── third_party/libbsc/            libbsc (BWT + QLFC engine)
+├── third_party/
+│   ├── libbsc/                    libbsc (BWT + QLFC engine)
+│   └── htscodecs/                 htscodecs (fqzcomp quality codec)
 ├── crates/
 │   ├── qz-lib/                    core library (all algorithms, no CLI deps)
-│   │   ├── src/compression/       BSC, ultra, quality_ctx, fqzcomp, etc.
-│   │   ├── src/io/fastq.rs        FASTQ reader/writer
-│   │   ├── build.rs               compiles libbsc via cc
-│   │   └── tests/                 30 roundtrip integration tests
-│   ├── qz-cli/                    CLI binary (Clap)
+│   │   ├── src/
+│   │   │   ├── compression/
+│   │   │   │   ├── mod.rs             module hub, constants, archive I/O helpers
+│   │   │   │   ├── compress_impl.rs   compression orchestration + streaming
+│   │   │   │   ├── decompress_impl.rs decompression + archive header parsing
+│   │   │   │   ├── codecs.rs          per-stream compress/decompress functions
+│   │   │   │   ├── bsc.rs             libbsc FFI bindings, block-parallel BSC
+│   │   │   │   ├── quality_ctx.rs     context-adaptive range coder for qualities
+│   │   │   │   ├── ultra.rs           ultra mode (reorder + HARC delta encoding)
+│   │   │   │   ├── template.rs        de Bruijn graph template sequence compression
+│   │   │   │   └── ...                20+ codec/algorithm modules
+│   │   │   └── io/fastq.rs        FASTQ/FASTA reader/writer
+│   │   ├── build.rs               compiles libbsc + htscodecs via cc
+│   │   └── tests/                 43 roundtrip integration tests
+│   ├── qz-cli/                    CLI binary (Clap) → produces `qz` executable
 │   ├── qz-python/                 Python bindings (PyO3/maturin)
 │   └── qz-bench/                  development benchmark binaries
 ├── benchmarks/                    benchmark scripts and results
@@ -226,7 +238,7 @@ qz/
 rustup run nightly cargo test --release
 ```
 
-30 roundtrip integration tests covering lossless, lossy quality modes, ultra mode, FASTA, and various compressor combinations.
+131 tests total: 88 unit tests (per-module codec roundtrips) and 43 integration tests covering lossless, lossy quality modes, ultra mode, FASTA, arithmetic/de Bruijn/delta/RLE encodings, error handling on corrupt archives, and edge cases.
 
 ## Environment Variables
 
