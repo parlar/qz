@@ -285,47 +285,107 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
     let has_quality = qualities_len > 0;
     let bits_per_qual = quality_binning.bits_per_quality();
 
-    // Open output file
+    // Open output file (or stdout if path is "-")
     if args.output.is_empty() {
         anyhow::bail!("No output file specified");
     }
     let output_path = &args.output[0];
-    let mut output: Box<dyn Write> = if args.gzipped {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        Box::new(std::io::BufWriter::with_capacity(
-            IO_BUFFER_SIZE,
-            GzEncoder::new(
-                std::fs::File::create(output_path)
-                    .with_context(|| format!("Failed to create output file: {:?}", output_path))?,
-                Compression::new(args.gzip_level),
-            ),
-        ))
-    } else {
-        Box::new(std::io::BufWriter::with_capacity(
-            IO_BUFFER_SIZE,
-            std::fs::File::create(output_path)
-                .with_context(|| format!("Failed to create output file: {:?}", output_path))?,
-        ))
-    };
+    let is_stdout = crate::cli::is_stdio_path(output_path);
 
     // Spawn parallel decompressor threads and stream records to output
     info!("Decompressing {} records with parallel BSC...", num_reads);
     let archive_path = &args.input;
 
+    // Use parallel gzip when --gzipped, otherwise plain buffered writer.
+    // ParCompress owns internal threads, so we create it outside the scope
+    // and call finish() after.
+    if args.gzipped {
+        use gzp::deflate::Gzip;
+        use gzp::par::compress::{ParCompress, ParCompressBuilder};
+        use gzp::Compression;
+        use gzp::ZWriter;
+
+        let num_gz_threads = (args.num_threads / 2).max(2);
+        // ParCompress::from_writer needs Send + 'static; Stdout qualifies, StdoutLock does not
+        let mut output: ParCompress<Gzip> = if is_stdout {
+            ParCompressBuilder::new()
+                .num_threads(num_gz_threads)
+                .map_err(|e| anyhow::anyhow!("gzp error: {e}"))?
+                .compression_level(Compression::new(args.gzip_level))
+                .from_writer(std::io::stdout())
+        } else {
+            let file = std::fs::File::create(output_path)
+                .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
+            ParCompressBuilder::new()
+                .num_threads(num_gz_threads)
+                .map_err(|e| anyhow::anyhow!("gzp error: {e}"))?
+                .compression_level(Compression::new(args.gzip_level))
+                .from_writer(file)
+        };
+
+        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset)?;
+
+        output.finish().map_err(|e| anyhow::anyhow!("gzp finish error: {e}"))?;
+    } else if is_stdout {
+        let mut output = std::io::BufWriter::with_capacity(IO_BUFFER_SIZE, std::io::stdout().lock());
+
+        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset)?;
+
+        output.flush()?;
+    } else {
+        let file = std::fs::File::create(output_path)
+            .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
+        let mut output = std::io::BufWriter::with_capacity(IO_BUFFER_SIZE, file);
+
+        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset)?;
+
+        output.flush()?;
+    }
+
+    info!("Decompressed {} records", num_reads);
+    let elapsed = start_time.elapsed();
+    info!("Decompression completed in {:.2}s", elapsed.as_secs_f64());
+
+    Ok(())
+}
+
+/// Stream decompressed records to an output writer.
+///
+/// Extracted from decompress_streaming_bsc to allow different writer types
+/// (plain buffered vs parallel gzip) without duplicating the decompression logic.
+fn stream_records_to_writer(
+    output: &mut dyn std::io::Write,
+    num_reads: usize,
+    archive_path: &std::path::Path,
+    h_offset: u64,
+    headers_len: usize,
+    s_offset: u64,
+    sequences_len: usize,
+    q_offset: u64,
+    qualities_len: usize,
+    has_quality: bool,
+    const_seq_len: usize,
+    const_qual_len: usize,
+    has_sequence_hints: bool,
+    bits_per_qual: usize,
+    quality_binning: QualityBinning,
+    has_rc_canon: bool,
+    rc_flags_len: usize,
+    rc_flags_offset: u64,
+) -> Result<()> {
     std::thread::scope(|scope| -> Result<()> {
         // Bounded channels: capacity 2 = max 2 pre-decompressed blocks buffered per stream
         let (h_tx, h_rx) = std::sync::mpsc::sync_channel(2);
         let (s_tx, s_rx) = std::sync::mpsc::sync_channel(2);
-        let h_path = archive_path.clone();
-        let s_path = archive_path.clone();
+        let h_path = archive_path.to_path_buf();
+        let s_path = archive_path.to_path_buf();
 
         scope.spawn(move || stream_decompressor(&h_path, h_offset, headers_len, h_tx));
         scope.spawn(move || stream_decompressor(&s_path, s_offset, sequences_len, s_tx));
 
         let q_rx = if has_quality {
             let (q_tx, q_rx) = std::sync::mpsc::sync_channel(2);
-            let q_path = archive_path.clone();
+            let q_path = archive_path.to_path_buf();
             scope.spawn(move || stream_decompressor(&q_path, q_offset, qualities_len, q_tx));
             Some(q_rx)
         } else {
@@ -335,7 +395,7 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
         // RC flags stream (encoding_type=6)
         let rc_rx = if has_rc_canon && rc_flags_len > 0 {
             let (rc_tx, rc_rx) = std::sync::mpsc::sync_channel(2);
-            let rc_path = archive_path.clone();
+            let rc_path = archive_path.to_path_buf();
             scope.spawn(move || stream_decompressor(&rc_path, rc_flags_offset, rc_flags_len, rc_tx));
             Some(rc_rx)
         } else {
@@ -379,7 +439,7 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
                 let q_len = if const_qual_len > 0 { const_qual_len } else { q.read_varint()? };
                 let packed_len = (q_len * bits_per_qual + 7) / 8;
                 let packed = q.read_bytes(packed_len)?;
-                columnar::unpack_qualities_to_writer(packed, q_len, quality_binning, &mut output)?;
+                columnar::unpack_qualities_to_writer(packed, q_len, quality_binning, output)?;
             }
             output.write_all(b"\n")?;
 
@@ -390,14 +450,33 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
 
         output.flush()?;
         Ok(())
-    })?;
+    })
+}
 
-    info!("Decompressed {} records", num_reads);
-    let elapsed = start_time.elapsed();
-    info!("Decompression completed in {:.2}s", elapsed.as_secs_f64());
-
+/// Write FASTQ records to a writer in 2MB batches.
+fn write_records_batched(output: &mut dyn std::io::Write, records: &[crate::io::fastq::FastqRecord]) -> Result<()> {
+    const WRITE_BATCH: usize = 2 * 1024 * 1024;
+    let mut buf = Vec::with_capacity(WRITE_BATCH + 1024);
+    for record in records {
+        buf.extend_from_slice(&record.id);
+        buf.push(b'\n');
+        buf.extend_from_slice(&record.sequence);
+        buf.extend_from_slice(b"\n+\n");
+        if let Some(qual) = &record.quality {
+            buf.extend_from_slice(qual);
+        }
+        buf.push(b'\n');
+        if buf.len() >= WRITE_BATCH {
+            output.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        output.write_all(&buf)?;
+    }
     Ok(())
 }
+
 /// Parsed archive header metadata.
 struct ArchiveHeader {
     encoding_type: u8,
@@ -583,6 +662,22 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
 
 pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     use std::io::Write;
+
+    // If input is stdin, spool to a temp file first (decompression needs seeking)
+    let (_stdin_tmp, args) = if crate::cli::is_stdio_path(&args.input) {
+        info!("Reading archive from stdin...");
+        let mut tmp = tempfile::NamedTempFile::new_in(&args.working_dir)
+            .context("Failed to create temp file for stdin")?;
+        std::io::copy(&mut std::io::stdin().lock(), &mut tmp)
+            .context("Failed to spool stdin to temp file")?;
+        let path = tmp.path().to_path_buf();
+        let mut new_args = args.clone();
+        new_args.input = path;
+        (Some(tmp), std::borrow::Cow::Owned(new_args))
+    } else {
+        (None, std::borrow::Cow::Borrowed(args))
+    };
+    let args = &*args;
 
     let start_time = Instant::now();
 
@@ -904,46 +999,43 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     }
 
     let output_path = &args.output[0];
-    let mut output = if args.gzipped {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        Box::new(std::io::BufWriter::with_capacity(
-            IO_BUFFER_SIZE,
-            GzEncoder::new(
-                std::fs::File::create(output_path)
-                    .with_context(|| format!("Failed to create output file: {:?}", output_path))?,
-                Compression::new(args.gzip_level),
-            ),
-        )) as Box<dyn Write>
-    } else {
-        Box::new(std::io::BufWriter::with_capacity(
-            IO_BUFFER_SIZE,
-            std::fs::File::create(output_path)
-                .with_context(|| format!("Failed to create output file: {:?}", output_path))?,
-        )) as Box<dyn Write>
-    };
+    let is_stdout = crate::cli::is_stdio_path(output_path);
 
-    // Batch FASTQ formatting into 2MB chunks to reduce write_all calls through dyn Write
-    {
-        const WRITE_BATCH: usize = 2 * 1024 * 1024;
-        let mut buf = Vec::with_capacity(WRITE_BATCH + 1024);
-        for record in &records {
-            buf.extend_from_slice(&record.id);
-            buf.push(b'\n');
-            buf.extend_from_slice(&record.sequence);
-            buf.extend_from_slice(b"\n+\n");
-            if let Some(qual) = &record.quality {
-                buf.extend_from_slice(qual);
-            }
-            buf.push(b'\n');
-            if buf.len() >= WRITE_BATCH {
-                output.write_all(&buf)?;
-                buf.clear();
-            }
-        }
-        if !buf.is_empty() {
-            output.write_all(&buf)?;
-        }
+    if args.gzipped {
+        use gzp::deflate::Gzip;
+        use gzp::par::compress::{ParCompress, ParCompressBuilder};
+        use gzp::Compression;
+        use gzp::ZWriter;
+
+        let num_gz_threads = (args.num_threads / 2).max(2);
+        let mut output: ParCompress<Gzip> = if is_stdout {
+            ParCompressBuilder::new()
+                .num_threads(num_gz_threads)
+                .map_err(|e| anyhow::anyhow!("gzp error: {e}"))?
+                .compression_level(Compression::new(args.gzip_level))
+                .from_writer(std::io::stdout())
+        } else {
+            let file = std::fs::File::create(output_path)
+                .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
+            ParCompressBuilder::new()
+                .num_threads(num_gz_threads)
+                .map_err(|e| anyhow::anyhow!("gzp error: {e}"))?
+                .compression_level(Compression::new(args.gzip_level))
+                .from_writer(file)
+        };
+
+        write_records_batched(&mut output, &records)?;
+        output.finish().map_err(|e| anyhow::anyhow!("gzp finish error: {e}"))?;
+    } else if is_stdout {
+        let mut output = std::io::BufWriter::with_capacity(IO_BUFFER_SIZE, std::io::stdout().lock());
+        write_records_batched(&mut output, &records)?;
+        output.flush()?;
+    } else {
+        let file = std::fs::File::create(output_path)
+            .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
+        let mut output = std::io::BufWriter::with_capacity(IO_BUFFER_SIZE, file);
+        write_records_batched(&mut output, &records)?;
+        output.flush()?;
     }
 
     let elapsed = start_time.elapsed();

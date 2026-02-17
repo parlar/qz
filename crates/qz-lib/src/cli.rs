@@ -191,3 +191,8 @@ pub fn num_cpus() -> usize {
         .map(|n| n.get())
         .unwrap_or(8)
 }
+
+/// Check if a path represents stdin/stdout (the `-` convention).
+pub fn is_stdio_path(p: &std::path::Path) -> bool {
+    p.as_os_str() == "-"
+}

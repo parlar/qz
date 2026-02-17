@@ -164,7 +164,7 @@ pub fn unpack_qualities(packed: &[u8], length: usize, binning: QualityBinning) -
 }
 
 /// Unpack quality scores directly to a writer, avoiding intermediate String allocation
-pub fn unpack_qualities_to_writer<W: Write>(
+pub fn unpack_qualities_to_writer<W: Write + ?Sized>(
     packed: &[u8],
     length: usize,
     binning: QualityBinning,

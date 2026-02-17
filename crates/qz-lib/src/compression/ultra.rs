@@ -1044,7 +1044,7 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
     let mut num_reads: usize = 0;
     let mut original_size: usize = 0;
 
-    let mut reader = crate::io::FastqReader::from_path(&args.input[0], args.fasta)?;
+    let mut reader = crate::io::FastqReader::from_path_or_stdin(&args.input[0], args.fasta)?;
 
     // Read first chunk to check variable-length reads
     let (first_records, _, first_orig) = read_chunk_records(&mut reader, chunk_size)?;
@@ -1052,8 +1052,12 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
         // Empty file — write minimal archive and return
         h_tmp.flush()?; s_tmp.flush()?; q_tmp.flush()?;
         drop(h_tmp); drop(s_tmp); drop(q_tmp);
-        let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
         use std::io::Write as _;
+        let mut out: Box<dyn Write> = if crate::cli::is_stdio_path(&args.output) {
+            Box::new(BufWriter::new(std::io::stdout().lock()))
+        } else {
+            Box::new(BufWriter::new(std::fs::File::create(&args.output)?))
+        };
         // v2 prefix + empty 52-byte body
         out.write_all(&ARCHIVE_MAGIC)?;
         out.write_all(&[ARCHIVE_VERSION, 0])?;
@@ -1171,7 +1175,11 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
     let q_size = if q_num_blocks > 0 { 4 + q_tmp_size } else { 0 };
 
     info!("Writing output file...");
-    let mut out = BufWriter::new(std::fs::File::create(&args.output)?);
+    let mut out: Box<dyn std::io::Write> = if crate::cli::is_stdio_path(&args.output) {
+        Box::new(BufWriter::new(std::io::stdout().lock()))
+    } else {
+        Box::new(BufWriter::new(std::fs::File::create(&args.output)?))
+    };
 
     // v2 prefix: magic + version + reserved + header_size
     let header_size: u32 = (V2_PREFIX_SIZE + 52) as u32; // 8 + 52 = 60

@@ -30,10 +30,12 @@ pub struct FastqReader<R: BufRead> {
     buffer: Vec<u8>,
 }
 
-// Enum to hold either a plain file reader or gzipped reader
+// Enum to hold either a plain file reader, gzipped reader, or stdin reader
 pub enum FileReader {
     Plain(BufReader<std::fs::File>),
     Gzipped(BufReader<GzDecoder<BufReader<std::fs::File>>>),
+    Stdin(BufReader<std::io::Stdin>),
+    StdinGzipped(BufReader<GzDecoder<BufReader<std::io::Stdin>>>),
 }
 
 impl Read for FileReader {
@@ -41,6 +43,8 @@ impl Read for FileReader {
         match self {
             FileReader::Plain(r) => r.read(buf),
             FileReader::Gzipped(r) => r.read(buf),
+            FileReader::Stdin(r) => r.read(buf),
+            FileReader::StdinGzipped(r) => r.read(buf),
         }
     }
 }
@@ -50,6 +54,8 @@ impl BufRead for FileReader {
         match self {
             FileReader::Plain(r) => r.fill_buf(),
             FileReader::Gzipped(r) => r.fill_buf(),
+            FileReader::Stdin(r) => r.fill_buf(),
+            FileReader::StdinGzipped(r) => r.fill_buf(),
         }
     }
 
@@ -57,11 +63,21 @@ impl BufRead for FileReader {
         match self {
             FileReader::Plain(r) => r.consume(amt),
             FileReader::Gzipped(r) => r.consume(amt),
+            FileReader::Stdin(r) => r.consume(amt),
+            FileReader::StdinGzipped(r) => r.consume(amt),
         }
     }
 }
 
 impl FastqReader<FileReader> {
+    /// Open a FASTQ file (auto-detects gzip), or read from stdin if path is `-`.
+    pub fn from_path_or_stdin(path: impl AsRef<Path>, is_fasta: bool) -> Result<Self> {
+        if crate::cli::is_stdio_path(path.as_ref()) {
+            return Self::from_stdin(is_fasta);
+        }
+        Self::from_path(path, is_fasta)
+    }
+
     /// Open a FASTQ file (auto-detects gzip)
     pub fn from_path(path: impl AsRef<Path>, is_fasta: bool) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref())
@@ -79,6 +95,24 @@ impl FastqReader<FileReader> {
             FileReader::Gzipped(BufReader::new(decoder))
         } else {
             FileReader::Plain(buffered)
+        };
+
+        Ok(Self::new(reader, is_fasta))
+    }
+
+    /// Read FASTQ from stdin (auto-detects gzip)
+    pub fn from_stdin(is_fasta: bool) -> Result<Self> {
+        let mut buffered = BufReader::with_capacity(4 * 1024 * 1024, std::io::stdin());
+        let is_gzipped = {
+            let peek = buffered.fill_buf()?;
+            peek.len() >= 2 && peek[0] == 0x1f && peek[1] == 0x8b
+        };
+
+        let reader = if is_gzipped {
+            let decoder = GzDecoder::new(buffered);
+            FileReader::StdinGzipped(BufReader::new(decoder))
+        } else {
+            FileReader::Stdin(buffered)
         };
 
         Ok(Self::new(reader, is_fasta))

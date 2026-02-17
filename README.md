@@ -16,87 +16,294 @@ All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) an
 
 | Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
 |------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 435 | **8.03x** | 17.6 s | 5.9 GB | 14.7 s | 6.7 GB |
-| **QZ ultra 3** | 416 | **8.39x** | 34.2 s | 13.8 GB | 21.3 s | 8.5 GB |
-| SPRING | 431 | 8.10x | 65.2 s | 9.9 GB | 16.9 s | 10.0 GB |
-| bzip2 -9 | 542 | 6.44x | 168.5 s | 7.3 MB | 88.2 s | 4.5 MB |
-| pigz -9 | 695 | 5.02x | 10.0 s | 22.5 MB | 8.0 s | 1.7 MB |
+| **QZ default** | 435 | **8.03x** | 17.4 s | 5.8 GB | 13.8 s | 6.9 GB |
+| **QZ ultra 1** | 426 | **8.21x** | 28.4 s | 7.6 GB | 14.2 s | 8.7 GB |
+| **QZ ultra 3** | 416 | **8.39x** | 37.1 s | 13.8 GB | 21.6 s | 8.5 GB |
+| **QZ ultra 5** | 416 | **8.39x** | 31.4 s | 14.0 GB | 1:02.5 | 8.5 GB |
+| SPRING | 431 | 8.10x | 1:01.4 | 11.9 GB | 15.4 s | 10.0 GB |
+| bzip2 -9 | 542 | 6.44x | 2:47.8 | 7.3 MB | 1:26.6 | 4.5 MB |
+| pigz -9 | 695 | 5.02x | 9.7 s | 20.8 MB | 7.9 s | 1.7 MB |
 
-SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results_10m_optimized.txt`](benchmarks/results_10m_optimized.txt).
+SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results_10m_all_ultra.txt`](benchmarks/results_10m_all_ultra.txt).
 
-## Method
+## Architecture
 
-### Stream separation
-
-Each FASTQ record contributes to three independent byte streams:
+### System overview
 
 ```
-FASTQ record
-    ├─ Header   (@SRR... instrument/run/flowcell/...)
-    ├─ Sequence  (ACGTN...)
-    └─ Quality   (Phred+33 ASCII)
+                            ┌──────────────────────────────────────────────┐
+                            │              QZ Compression                  │
+                            │                                              │
+  FASTQ input ──►  FastqReader ──►  Chunk loop (2.5M records) ─────────────┤
+  (file, .gz,      (buffered,       │                                      │
+   or stdin)        auto-detect     │  ┌────────── rayon::join ─────────┐  │
+                    gzip)           │  │                                │  │
+                                    │  │  Headers ──► BSC blocks ──┐    │  │
+                                    │  │                           │    │  │
+                                    │  │  ┌── rayon::join ──────┐  │    │  │
+                                    │  │  │                     │  │    │  │
+                                    │  │  │ Sequences ► BSC ──┐ │  │    │  │
+                                    │  │  │                   │ │  │    │  │
+                                    │  │  │ Qualities ► BSC ──┤ │  │    │  │
+                                    │  │  │  or quality_ctx   │ │  │    │  │
+                                    │  │  └───────────────────┘ │  │    │  │
+                                    │  └────────────────────────┘  │    │  │
+                                    │                              │    │  │
+                                    │         Compressed blocks ◄──┘    │  │
+                                    │              │                    │  │
+                                    │              ▼                    │  │
+                                    │     Temp files or memory          │  │
+                                    └──────────────┬────────────────────┘  │
+                                                   │                       │
+                                                   ▼                       │
+                                          Archive assembly                 │
+                                          (header + stream blocks)         │
+                                                   │                       │
+                                                   ▼                       │
+                                              .qz archive ───────────────► │
+                                          (file or stdout)                 │
+                            └──────────────────────────────────────────────┘
+
+
+                            ┌──────────────────────────────────────────────┐
+                            │            QZ Decompression                  │
+                            │                                              │
+  .qz archive ──►  Parse archive header ──► Spawn 3 decompressor threads   │
+  (file or           (magic, version,        │                             │
+   stdin→tmpfile)     stream offsets)        │  Thread 1: Headers ──┐      │
+                                             │    BSC decompress    │      │
+                                             │    (batch=8 blocks)  │      │
+                                             │                      │      │
+                                             │  Thread 2: Seqs ─────┤      │
+                                             │    BSC decompress    │      │
+                                             │                      │      │
+                                             │  Thread 3: Quals ────┤      │
+                                             │    BSC decompress    │      │
+                                             │                      │      │
+                                             │     bounded channels │      │
+                                             │     (capacity = 2)   │      │
+                                             │          │           │      │
+                                             │          ▼           │      │
+                                             │  Main thread:        │      │
+                                             │    Reconstruct       │      │
+                                             │    FASTQ records     │      │
+                                             │    from 3 streams    │      │
+                                             │          │           │      │
+                                             │          ▼           │      │
+                                             │  FASTQ output ──────►│      │
+                                             │  (file, .gz,         │      │
+                                             │   or stdout)         │      │
+                            └──────────────────────────────────────────────┘
 ```
 
-Headers, sequences, and qualities are concatenated separately, then each stream is split into 25 MB blocks and compressed in parallel using libbsc's adaptive BWT + QLFC pipeline. The three streams are compressed concurrently via `rayon::join`.
+### Compression pipeline
+
+Compression proceeds in five stages: reading, stream building, parallel compression, block accumulation, and archive assembly.
+
+**Stage 1: Chunked reading.** The FASTQ reader (`FastqReader`) reads records in chunks of 2.5M (default mode) or 5M (ultra mode). Input may be a file, gzipped file (auto-detected via magic bytes), or stdin. Each chunk yields a `Vec<FastqRecord>` where records store raw bytes (`Vec<u8>`) to avoid UTF-8 validation overhead. Reading is pipelined: the main thread reads the next chunk while a background `std::thread::scope` compresses the current one.
+
+```
+Main thread:     ┃ Read chunk 0 ┃ Read chunk 1 ┃ Read chunk 2 ┃ ...
+                 ┃              ┃              ┃              ┃
+Compress thread: ┃              ┃ Compress 0   ┃ Compress 1   ┃ ...
+                                ╰──overlapped──╯
+```
+
+**Stage 2: Stream building.** Each chunk's records are split into three byte streams by `records_to_streams()`:
+
+| Stream | Format | Content |
+|--------|--------|---------|
+| Headers | `[varint(len), raw bytes]...` | `@SRR...` identifier lines |
+| Sequences | `[varint(len), bases]...` | `ACGTN...` DNA bases |
+| Qualities | `[varint(len), packed bytes]...` | Phred+33 scores, optionally bit-packed |
+
+When all reads have the same length (common for Illumina), per-read varint framing is omitted and the constant length is stored once in the archive header, saving ~1 byte per read.
+
+**Stage 3: Parallel compression.** The three streams are compressed concurrently using nested `rayon::join`:
+
+```
+rayon::join(
+    ║ Headers ──► BSC (25 MB blocks, adaptive QLFC, no LZP)
+    ║
+    ║ rayon::join(
+    ║     ║ Sequences ──► BSC (25 MB blocks)
+    ║     ║ Qualities ──► BSC or quality_ctx (500K-read sub-blocks)
+    ║ )
+)
+```
+
+Each stream is split into 25 MB blocks that are compressed independently via `rayon::par_iter`. BSC uses the Burrows-Wheeler Transform followed by adaptive Quantized Local Frequency Coding (QLFC). LZP (Lempel-Ziv Prediction) is disabled in the default path because the BWT already captures repeating patterns; LZP adds 5–10% runtime with negligible compression gain on genomic data.
+
+Compressed blocks are shrunk via `shrink_to_fit()` immediately after compression. Without this, BSC's output buffer allocation (input size + header per block) would waste ~35 GB across 1400 blocks.
+
+**Stage 4: Block accumulation.** Compressed blocks are accumulated either in memory (`Vec<Vec<u8>>` for small inputs) or streamed to temp files (for large inputs or reorder mode). Temp files use a RAII cleanup guard (`TmpCleanup`) that deletes files on drop, including on panic or error.
+
+**Stage 5: Archive assembly.** The archive is written sequentially: v2 header, then header blocks, sequence blocks, quality blocks. No seeking is required, so output can go to stdout. The archive format is:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  V2 prefix (8 bytes)                                             │
+│  ┌──────────┬─────────┬──────────┬────────────────┐              │
+│  │ "QZ"     │ ver=02  │ rsvd=00  │ header_size u32│              │
+│  └──────────┴─────────┴──────────┴────────────────┘              │
+│                                                                  │
+│  Header body (variable length)                                   │
+│  ┌────────────────────────────────────────────────────────┐      │
+│  │ encoding_type, flags, quality_binning                  │      │
+│  │ quality_compressor, sequence_compressor, header_comp   │      │
+│  │ num_reads (u64), stream lengths (u64 x 4)              │      │
+│  │ const_seq_len, const_qual_len (if flag set)            │      │
+│  └────────────────────────────────────────────────────────┘      │
+│                                                                  │
+│  Stream data                                                     │
+│  ┌────────────────────────────────────────────────────────┐      │
+│  │ Headers:   num_blocks u32, [len u32, data]...          │      │
+│  │ Sequences: num_blocks u32, [len u32, data]...          │      │
+│  │ Qualities: num_blocks u32, [len u32, data]...          │      │
+│  └────────────────────────────────────────────────────────┘      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The header is self-describing: all compressor types, encoding modes, and stream lengths are recorded, so decompression requires no external metadata.
+
+### Decompression pipeline
+
+Decompression uses a streaming architecture with three parallel decompressor threads feeding a single reconstruction thread through bounded channels.
+
+**Header parsing.** The archive header is read and validated (magic bytes `QZ`, version `0x02`). Stream offsets are computed from the recorded lengths: headers start at `data_offset`, sequences at `data_offset + headers_len`, qualities at `data_offset + headers_len + sequences_len`.
+
+**Parallel decompression.** Three background threads are spawned via `std::thread::scope`, each responsible for one stream:
+
+1. Seek to stream offset in the archive file
+2. Read `num_blocks` from the stream header
+3. In batches of 8: read block headers and data sequentially, decompress the batch in parallel via `rayon::par_iter`, send decompressed blocks through a bounded `SyncSender` channel
+
+The channel capacity is 2 blocks per stream. This backpressures the decompressor threads when the reconstruction thread falls behind, bounding peak memory to ~300 MB (3 streams x ~4 blocks x 25 MB + output buffer).
+
+**Record reconstruction.** The main thread reads from all three channels through `ChannelStreamBuffer` wrappers that provide varint/byte-slice reading over the channel. For each of the `num_reads` records, it reads the header length and bytes, sequence length and bytes, and quality length and packed bytes, unpacks qualities to ASCII, and writes the four FASTQ lines (`@header\nseq\n+\nqual\n`).
+
+**Stdin input.** Since the decompressor needs to seek to three different offsets in the archive, stdin input is spooled to a temp file first, then decompressed normally.
+
+**Gzip output.** When `--gzipped` is requested, output is piped through `gzp::ParCompress` for parallel gzip compression (multi-threaded block compression into a multi-member gzip stream).
+
+### BSC block compression
+
+[libbsc](https://github.com/IlyaGrebnov/libbsc) applies the Burrows-Wheeler Transform (via [libsais](https://github.com/IlyaGrebnov/libsais)) to sort all rotations of the input block, clustering repeated substrings. The BWT output is then compressed by adaptive QLFC, which models local symbol frequencies. The block size is 25 MB.
+
+QZ compiles libbsc and libsais from source via `build.rs` with `-O3 -march=native` and OpenMP support. The complete libbsc pipeline is available: BWT, LZP (Lempel-Ziv Prediction), QLFC (static and adaptive), sort transform, and preprocessing filters. QZ drives it through Rust FFI bindings (`bsc.rs`).
+
+```
+Stream (75 MB)
+    ├─ Block 0 (25 MB) ──► BWT ──► QLFC ──► compressed (rayon worker 1)
+    ├─ Block 1 (25 MB) ──► BWT ──► QLFC ──► compressed (rayon worker 2)
+    └─ Block 2 (25 MB) ──► BWT ──► QLFC ──► compressed (rayon worker 3)
+```
+
+The default configuration uses adaptive QLFC without LZP (`compress_parallel_adaptive_no_lzp`). Adaptive QLFC learns symbol frequencies during encoding, improving compression by 0.5–0.7% over the static variant. LZP is disabled because the BWT already captures the repeating k-mer structure in genomic data; LZP adds 5–10% runtime with negligible compression benefit.
+
+**Two-level threading model.** libbsc has its own OpenMP-based multithreading for parallelizing the BWT within a single block. QZ adds a second level of parallelism above it using rayon for inter-block parallelism. These two levels interact carefully:
+
+```
+                    ┌───────────────────────────────────────┐
+                    │       rayon thread pool               │
+                    │       (inter-block parallelism)       │
+                    │                                       │
+                    │  Worker 1: Block 0                    │
+                    │    └─ bsc_compress(FASTMODE)          │
+                    │       └─ BWT (single-threaded)        │
+                    │       └─ QLFC adaptive                │
+                    │                                       │
+                    │  Worker 2: Block 1                    │
+                    │    └─ bsc_compress(FASTMODE)          │
+                    │       └─ BWT (single-threaded)        │
+                    │       └─ QLFC adaptive                │
+                    │                                       │
+                    │  Worker N: Block N                    │
+                    │    └─ ...                             │
+                    └───────────────────────────────────────┘
+
+                    vs.
+
+                    ┌───────────────────────────────────────┐
+                    │       Single block, MT mode           │
+                    │       (intra-block parallelism)       │
+                    │                                       │
+                    │  bsc_compress(FASTMODE|MULTITHREADING)│
+                    │    └─ BWT via libsais_bwt_omp()       │
+                    │       └─ up to 16 OpenMP threads      │
+                    │    └─ QLFC adaptive                   │
+                    └───────────────────────────────────────┘
+```
+
+libbsc supports two feature flags passed per call:
+
+| Flag | Effect |
+|------|--------|
+| `FASTMODE` | Enables fast decompression; skips expensive data-type detection |
+| `MULTITHREADING` | Enables OpenMP parallelism within BWT (libsais) |
+
+The default compression path uses **FASTMODE only**: each 25 MB block gets a single-threaded BWT, but rayon runs many blocks concurrently. This avoids thread explosion (N rayon workers x M OpenMP threads) and gives better throughput than intra-block parallelism for typical genomic workloads with many blocks.
+
+The MT path (`FASTMODE | MULTITHREADING`) is available for single large blocks where intra-block parallelism matters more. When used, OpenMP threads are capped at 12 via `omp_set_num_threads()`.
+
+**libbsc modification.** QZ patches one file in the libbsc source: `bwt.cpp`. Upstream libbsc caps the thread count passed to `libsais_bwt_omp()` at 8. QZ raises this cap to 16 to better utilize high-core machines:
+
+```c
+// upstream:  numThreads > 8 ? 8 : numThreads
+// QZ:        numThreads > 16 ? 16 : numThreads
+```
+
+This affects both `libsais_bwt_aux_omp()` and `libsais_bwt_omp()` calls. On a 72-core system, the effective thread count per BWT call is `min(omp_get_max_threads() / omp_get_num_threads(), 16)`, allowing better scaling when the MT path is used for large individual blocks.
 
 ### Quality score compression
 
-Quality scores exhibit strong positional correlation (systematic 3' degradation), sequential correlation (adjacent scores are similar), and sequence-dependent effects (certain motifs produce characteristic quality profiles). Generic block-sorting captures some of this structure, but a context model that conditions directly on these features achieves better compression.
-
-**Compressor selection.** QZ automatically selects between two quality compressors based on input characteristics:
+QZ automatically selects the quality compressor based on input:
 
 | Condition | Compressor | Rationale |
 |-----------|-----------|-----------|
-| Lossless, >= 100K reads | `quality_ctx` | Adaptive context models require sufficient data to converge; above this threshold they outperform BSC by ~7% |
+| Lossless, >= 100K reads | `quality_ctx` | Context model outperforms BSC by ~7% once converged |
 | Lossless, < 100K reads | BSC | Insufficient data for context model convergence |
-| Lossy modes | BSC | Reduced alphabet (3–7 bits) compresses efficiently under BWT without context modeling |
+| Lossy modes | BSC | Reduced alphabet (3–7 bits) compresses well under BWT |
 
-**Context model.** `quality_ctx` is an LZMA-style forward range coder with 160,000 adaptive contexts. For each quality symbol, the context is the cross-product of:
+**Context model.** `quality_ctx` is an LZMA-style forward range coder with 160,000 adaptive contexts. Each quality symbol is coded in a context formed by the cross-product of:
 
 | Feature | States | Description |
 |---------|--------|-------------|
 | Position bin | 64 | `floor(pos / 5)`, captures positional quality curve |
 | Previous quality | 50 | Phred score of preceding base (0–49) |
-| Stability | 2 | `|q[i-1] - q[i-2]| <= 2` (stable) vs. changing |
+| Stability | 2 | `\|q[i-1] - q[i-2]\| <= 2` (stable) vs. changing |
 | Base pair | 25 | `prev_base * 5 + cur_base` (A/C/G/T/N x A/C/G/T/N) |
 
-Each context maintains a Laplace-smoothed frequency table over the observed quality alphabet (~20 symbols for Illumina), updated on every symbol and rescaled (halving with minimum frequency 1) when the total exceeds 2^20. The range coder uses 64-bit carry propagation and renormalizes below 2^24.
+Each context maintains a Laplace-smoothed frequency table (~20 symbols for Illumina), updated per symbol and rescaled when the total exceeds 2^20. For large inputs, quality scores are partitioned into 500K-read sub-blocks compressed independently in parallel.
 
 On 150 bp Illumina WGS, `quality_ctx` achieves ~0.15 bits per quality score. Quality data accounts for ~6% of total archive size in lossless mode.
 
-**Parallelism.** For large inputs, quality scores are partitioned into 500K-read sub-blocks, each encoded independently and in parallel. The sub-block format is self-describing: `[num_blocks: u32][block_len: u32, blob]...`.
+**Lossy quantization.** Quality scores may be quantized before compression: Illumina 8-level binning maps ~40 Phred values to 8 representatives (3 bits/symbol); discard mode replaces all scores with a constant. Quantized scores are bit-packed to the minimum width.
 
-**Lossy quantization.** Before compression, quality scores may be quantized: Illumina 8-level binning maps ~40 Phred values to 8 representatives (3 bits/symbol); discard mode replaces all scores with a constant. Quantized scores are bit-packed to the minimum width before compression.
-
-**Relation to prior work.** The context model draws on two key contributions:
-
-- *fqzcomp* (Bonfield, 2013; [paper](https://doi.org/10.1093/bioinformatics/btac010)) demonstrated that conditioning on previous quality values and a running delta counter substantially improves quality compression. fqzcomp uses an adaptive arithmetic coder with up to 16 configurable context bits and was adopted as the quality codec in CRAM 3.1. QZ integrates fqzcomp via FFI through [htscodecs](https://github.com/samtools/htscodecs) as an alternative backend.
-
-- *ENANO* (Dufort y Álvarez et al., 2020; [paper](https://doi.org/10.1093/bioinformatics/btaa551)) introduced DNA sequence context (6-base sliding window) and multi-level error confidence tracking into quality modeling, achieving strong results on nanopore data with ~32K contexts.
-
-QZ adapts both ideas for Illumina short reads: a 2-base sequence window (vs. ENANO's 6) and a binary stability flag (vs. ENANO's 4-tier confidence), yielding a larger context space (160K vs. 32K) that converges faster on the narrower Illumina quality distribution.
-
-| | fqzcomp | ENANO | QZ |
-|---|---------|-------|----|
-| Target data | General (CRAM 3.1) | Nanopore | Illumina short reads |
-| Entropy coder | Adaptive arithmetic | Range coder (Shelwien) | LZMA-style range coder |
-| Contexts | Up to 2^16 | ~32K | 160K |
-| Position | Raw or LUT-quantized | Implicit via sequence window | Binned by 5 (64 bins) |
-| Previous quality | Last 2, shifted+OR | Last 2, quantized difference | Last 1, direct (0–49) |
-| Sequence context | None | 6-base sliding window | Previous + current base (5x5) |
-| Stability/delta | Running delta counter | 4-tier error confidence | Binary stable/changing |
-| Self-describing | Yes | No | No |
+**Relation to prior work.** The context model draws on fqzcomp (Bonfield, 2013; [paper](https://doi.org/10.1093/bioinformatics/btac010)), which demonstrated quality-conditioned arithmetic coding and was adopted as the CRAM 3.1 quality codec, and ENANO (Dufort y Alvarez et al., 2020; [paper](https://doi.org/10.1093/bioinformatics/btaa551)), which introduced DNA sequence context and stability tracking for nanopore data. QZ adapts both for Illumina short reads with a 2-base window and binary stability flag, yielding 160K contexts that converge fast on the narrow Illumina quality distribution.
 
 ### Ultra mode
 
-Ultra mode (`--ultra [1-5]`) increases compression by processing 5M-record chunks, enabling BSC with LZP (Lempel-Ziv Prediction before BWT), and compressing 2 chunks in parallel. Levels trade speed and memory for ratio:
+Ultra mode (`--ultra [1-5]`) increases compression by reordering reads to group similar sequences together before compression. Levels control chunk size and parallelism:
 
-| Level | RAM | Description |
-|-------|-----|-------------|
-| 1 | ~8 GB | Fast |
-| 3 | ~17 GB | High compression |
-| 5 | ~17 GB | Maximum compression |
-| auto | varies | Selects highest level fitting available RAM |
+| Level | Chunk size | Parallel chunks | Quality sub-block | RAM |
+|-------|-----------|-----------------|-------------------|-----|
+| 1 | 1M | 4 | 250K | ~8 GB |
+| 3 | 5M | 2 | 500K | ~14 GB |
+| 5 | 10M | 1 | 1M | ~14 GB |
+| auto | varies | varies | varies | fits available RAM |
+
+**Reordering strategy.** Reads are grouped by sequence similarity using center-hash grouping: two 32-bit hashes are computed from the central 32 bases of each read, and reads sharing a hash are placed adjacent in the output. Singletons (unique hashes) remain in input order to preserve BWT-friendly locality. The permutation is stored in the archive so the decompressor can restore original order.
+
+### Memory management
+
+Memory is the primary constraint for high-throughput genomic compression. QZ uses several strategies to keep peak usage bounded:
+
+- **Sequential stream compression.** Within each chunk, headers, sequences, and qualities are compressed sequentially (not all three simultaneously). This prevents 70+ concurrent BWT allocations that would consume ~14 GB.
+- **Pipelined I/O.** Reading the next chunk overlaps with compressing the current one, hiding I/O latency without doubling memory.
+- **Block shrinking.** `shrink_to_fit()` on each BSC output block releases the unused allocation headroom (BSC allocates output = input + header).
+- **Temp file accumulation.** For large inputs, compressed blocks are streamed to disk rather than held in memory. A RAII drop guard ensures cleanup on success, error, or panic.
+- **Bounded decompression channels.** Decompressor threads send blocks through channels with capacity 2, preventing unbounded memory growth when the writer is slower than decompression.
 
 ## Installation
 
@@ -145,14 +352,28 @@ qz decompress -i reads.qz -o reads.fastq
 qz decompress -i reads.qz -o reads.fastq.gz --gzipped           # gzipped output
 ```
 
+### Piping (stdin/stdout)
+
+Use `-` for `-i` or `-o` to read from stdin or write to stdout:
+
+```bash
+cat reads.fastq | qz compress -i - -o reads.qz                  # compress from stdin
+qz compress -i reads.fastq -o - > reads.qz                      # compress to stdout
+qz decompress -i reads.qz -o - > reads.fastq                    # decompress to stdout
+cat reads.qz | qz decompress -i - -o reads.fastq                # decompress from stdin
+cat reads.fastq | qz compress -i - -o - | qz decompress -i - -o - > out.fastq  # full pipe
+```
+
+All log output goes to stderr, so stdout remains clean for piped data. Decompression from stdin spools the archive to a temp file first (the decompressor needs to seek to stream offsets).
+
 ### CLI reference
 
 **Compress:**
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i, --input FILE` | Input FASTQ file (gzipped auto-detected) | required |
-| `-o, --output FILE` | Output QZ archive | required |
+| `-i, --input FILE` | Input FASTQ file (gzipped auto-detected, `-` for stdin) | required |
+| `-o, --output FILE` | Output QZ archive (`-` for stdout) | required |
 | `-w, --working-dir PATH` | Working directory for temp files | `.` |
 | `-t, --threads N` | Thread count (0 = auto) | auto |
 | `--fasta` | Input is FASTA format | off |
@@ -164,8 +385,8 @@ qz decompress -i reads.qz -o reads.fastq.gz --gzipped           # gzipped output
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i, --input FILE` | Input QZ archive | required |
-| `-o, --output FILE` | Output FASTQ file | required |
+| `-i, --input FILE` | Input QZ archive (`-` for stdin) | required |
+| `-o, --output FILE` | Output FASTQ file (`-` for stdout) | required |
 | `-w, --working-dir PATH` | Working directory for temp files | `.` |
 | `-t, --threads N` | Thread count | auto |
 | `--gzipped` | Output gzipped FASTQ | off |
@@ -207,30 +428,44 @@ compression::compress(&config)?;
 qz/
 ├── Cargo.toml                     workspace root
 ├── third_party/
-│   ├── libbsc/                    libbsc (BWT + QLFC engine)
-│   └── htscodecs/                 htscodecs (fqzcomp quality codec)
+│   ├── libbsc/                    libbsc (BWT + QLFC), compiled via build.rs
+│   │   └── libbsc/bwt/bwt.cpp     ← patched: BWT thread cap 8→16
+│   └── htscodecs/                 htscodecs (fqzcomp quality codec), unmodified
 ├── crates/
 │   ├── qz-lib/                    core library (all algorithms, no CLI deps)
 │   │   ├── src/
 │   │   │   ├── compression/
-│   │   │   │   ├── mod.rs             module hub, constants, archive I/O helpers
-│   │   │   │   ├── compress_impl.rs   compression orchestration + streaming
-│   │   │   │   ├── decompress_impl.rs decompression + archive header parsing
-│   │   │   │   ├── codecs.rs          per-stream compress/decompress functions
-│   │   │   │   ├── bsc.rs             libbsc FFI bindings, block-parallel BSC
-│   │   │   │   ├── quality_ctx.rs     context-adaptive range coder for qualities
-│   │   │   │   ├── ultra.rs           ultra mode (reorder + HARC delta encoding)
-│   │   │   │   ├── template.rs        de Bruijn graph template sequence compression
-│   │   │   │   └── ...                20+ codec/algorithm modules
-│   │   │   └── io/fastq.rs        FASTQ/FASTA reader/writer
-│   │   ├── build.rs               compiles libbsc + htscodecs via cc
-│   │   └── tests/                 43 roundtrip integration tests
+│   │   │   │   ├── mod.rs             archive format, I/O helpers, public API
+│   │   │   │   ├── compress_impl.rs   chunked compression orchestrator
+│   │   │   │   ├── decompress_impl.rs streaming decompression + header parsing
+│   │   │   │   ├── codecs.rs          per-stream compress/decompress dispatch
+│   │   │   │   ├── bsc.rs             libbsc FFI, block-parallel BSC, threading
+│   │   │   │   ├── quality_ctx.rs     context-adaptive range coder (160K contexts)
+│   │   │   │   ├── ultra.rs           ultra mode (reorder + quality_ctx)
+│   │   │   │   ├── columnar.rs        quality binning + bit-packing
+│   │   │   │   ├── fqzcomp.rs         htscodecs FFI for fqzcomp quality codec
+│   │   │   │   ├── header_col.rs      columnar header compression
+│   │   │   │   ├── n_mask.rs          2-bit DNA encoding + N-bitmap
+│   │   │   │   ├── dna_utils.rs       k-mer hashing, reverse complement
+│   │   │   │   └── ...                additional codec modules
+│   │   │   ├── io/fastq.rs        FASTQ/FASTA reader (buffered, gzip, stdin)
+│   │   │   └── cli.rs             CompressConfig, DecompressConfig (no Clap)
+│   │   ├── build.rs               compiles libbsc + htscodecs as static C/C++ libs
+│   │   └── tests/                 38 roundtrip integration tests
 │   ├── qz-cli/                    CLI binary (Clap) → produces `qz` executable
 │   ├── qz-python/                 Python bindings (PyO3/maturin)
 │   └── qz-bench/                  development benchmark binaries
 ├── benchmarks/                    benchmark scripts and results
 └── real_data/                     test data (not tracked)
 ```
+
+### C/C++ dependencies
+
+`build.rs` compiles two C/C++ libraries as static archives linked into the final binary:
+
+**libbsc** — Block-sorting compressor. All source files are compiled with `-O3 -march=native -std=c++11 -fopenmp`. The `LIBBSC_OPENMP_SUPPORT` and `LIBSAIS_OPENMP` defines enable OpenMP-parallel BWT/suffix-array construction. One source file is patched (see [BSC block compression](#bsc-block-compression) above).
+
+**htscodecs** — Only `fqzcomp_qual.c` and `utils.c` are compiled (not the full library). These provide the fqzcomp quality compression algorithm, available as an alternative quality backend. No modifications to upstream source.
 
 ## Testing
 

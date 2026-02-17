@@ -533,10 +533,14 @@ fn write_chunked_archive(
     const_seq_len: usize,
     const_qual_len: usize,
 ) -> Result<()> {
-    use std::io::{Write, BufReader};
+    use std::io::{Write, BufReader, BufWriter};
 
     info!("Writing output file...");
-    let mut output_file = std::fs::File::create(output_path)?;
+    let mut output_file: Box<dyn Write> = if crate::cli::is_stdio_path(output_path) {
+        Box::new(BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout().lock()))
+    } else {
+        Box::new(std::fs::File::create(output_path)?)
+    };
 
     let rc_flags_len = rc_stream.as_ref().map(|rc| rc.flags_len).unwrap_or(0);
     let metadata_size = write_archive_header(
@@ -545,7 +549,7 @@ fn write_chunked_archive(
         const_seq_len, const_qual_len, rc_flags_len,
     )?;
 
-    let copy_stream = |num_blocks: u32, tmp_path: &std::path::Path, out: &mut std::fs::File| -> Result<()> {
+    let copy_stream = |num_blocks: u32, tmp_path: &std::path::Path, out: &mut dyn Write| -> Result<()> {
         if num_blocks == 0 { return Ok(()); }
         out.write_all(&num_blocks.to_le_bytes())?;
         let mut tmp_reader = BufReader::new(std::fs::File::open(tmp_path)?);
@@ -553,17 +557,19 @@ fn write_chunked_archive(
         Ok(())
     };
 
-    copy_stream(h_num_blocks, h_tmp_path, &mut output_file)?;
-    copy_stream(s_num_blocks, s_tmp_path, &mut output_file)?;
-    copy_stream(q_num_blocks, q_tmp_path, &mut output_file)?;
+    copy_stream(h_num_blocks, h_tmp_path, &mut *output_file)?;
+    copy_stream(s_num_blocks, s_tmp_path, &mut *output_file)?;
+    copy_stream(q_num_blocks, q_tmp_path, &mut *output_file)?;
 
     // Append RC flags stream after qualities (encoding_type=6 signals its presence)
     if let Some(ref rc) = rc_stream {
         if rc.num_blocks > 0 {
             output_file.write_all(&(rc.flags_len as u64).to_le_bytes())?;
-            copy_stream(rc.num_blocks, rc.tmp_path, &mut output_file)?;
+            copy_stream(rc.num_blocks, rc.tmp_path, &mut *output_file)?;
         }
     }
+
+    output_file.flush()?;
 
     log_compression_stats(original_size, headers_len, sequences_len, qualities_len, rc_flags_len, metadata_size, start_time.elapsed());
 

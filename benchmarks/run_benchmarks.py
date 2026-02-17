@@ -435,8 +435,8 @@ def main():
                         help="Number of threads (default: all cores)")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Output results file (default: benchmarks/results_<date>.txt)")
-    parser.add_argument("--ultra-level", type=int, default=3,
-                        help="QZ ultra level to benchmark (default: 3)")
+    parser.add_argument("--ultra-levels", type=int, nargs="*", default=[1, 3, 5],
+                        help="QZ ultra levels to benchmark (default: 1 3 5)")
     parser.add_argument("--skip", type=str, nargs="*", default=[],
                         help="Tools to skip (e.g. --skip spring bzip2)")
     args = parser.parse_args()
@@ -470,8 +470,12 @@ def main():
             ("bzip2",  lambda: bench_bzip2(input_fastq, tmpdir, input_size)),
             ("spring", lambda: bench_spring(input_fastq, args.threads, tmpdir, input_size)),
             ("qz",     lambda: bench_qz_default(input_fastq, args.threads, tmpdir, input_size)),
-            ("ultra",  lambda: bench_qz_ultra(input_fastq, args.ultra_level, args.threads, tmpdir, input_size)),
         ]
+        for level in args.ultra_levels:
+            lv = level  # capture for lambda
+            benchmarks.append(
+                (f"ultra{lv}", lambda lv=lv: bench_qz_ultra(input_fastq, lv, args.threads, tmpdir, input_size)),
+            )
 
         for key, fn in benchmarks:
             if key in skip:

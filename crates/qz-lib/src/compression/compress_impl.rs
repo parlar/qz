@@ -47,7 +47,7 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
         info!("Chunked compression: {} records per chunk", chunk_size);
     }
 
-    let mut reader = crate::io::FastqReader::from_path(input_path, args.fasta)?;
+    let mut reader = crate::io::FastqReader::from_path_or_stdin(input_path, args.fasta)?;
 
     // Read first chunk
     let (mut cur_records, mut cur_bases, mut cur_orig) =
@@ -353,7 +353,11 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
         }
 
         info!("Writing output file...");
-        let mut output_file = std::io::BufWriter::new(std::fs::File::create(&args.output)?);
+        let mut output_file: Box<dyn Write> = if crate::cli::is_stdio_path(&args.output) {
+            Box::new(std::io::BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout().lock()))
+        } else {
+            Box::new(std::io::BufWriter::new(std::fs::File::create(&args.output)?))
+        };
 
         let metadata_size = write_archive_header(
             &mut output_file, encoding_type, stream_quality_binning, quality_compressor_used,
@@ -362,7 +366,7 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
         )?;
 
         // Write streams in multi-block format: [num_blocks: u32][block_len: u32, block_data]...
-        let write_blocks = |blocks: &[Vec<u8>], out: &mut std::io::BufWriter<std::fs::File>| -> Result<()> {
+        let write_blocks = |blocks: &[Vec<u8>], out: &mut dyn Write| -> Result<()> {
             if blocks.is_empty() { return Ok(()); }
             out.write_all(&(blocks.len() as u32).to_le_bytes())?;
             for block in blocks {
@@ -372,13 +376,13 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
             Ok(())
         };
 
-        write_blocks(&all_h_blocks, &mut output_file)?;
-        write_blocks(&all_s_blocks, &mut output_file)?;
-        write_blocks(&all_q_blocks, &mut output_file)?;
+        write_blocks(&all_h_blocks, &mut *output_file)?;
+        write_blocks(&all_s_blocks, &mut *output_file)?;
+        write_blocks(&all_q_blocks, &mut *output_file)?;
 
         if !all_rc_blocks.is_empty() {
             output_file.write_all(&(rc_flags_len as u64).to_le_bytes())?;
-            write_blocks(&all_rc_blocks, &mut output_file)?;
+            write_blocks(&all_rc_blocks, &mut *output_file)?;
         }
         output_file.flush()?;
 
@@ -453,7 +457,7 @@ pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
     let mut original_size: usize = 0;
 
     {
-        let mut reader = crate::io::FastqReader::from_path(input_path, args.fasta)?;
+        let mut reader = crate::io::FastqReader::from_path_or_stdin(input_path, args.fasta)?;
         while let Some(record) = reader.next()? {
             let qual_bytes = record.quality.as_ref().map(|q| q.as_slice()).unwrap_or(&[]);
             let key = dna_utils::reorder_sort_key(&record.sequence, qual_bytes);
@@ -731,7 +735,7 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
 
     info!("Reading FASTQ file...");
     let input_path = &args.input[0];
-    let mut reader = FastqReader::from_path(input_path, false)?; // false = FASTQ format
+    let mut reader = FastqReader::from_path_or_stdin(input_path, false)?; // false = FASTQ format
     let mut records = Vec::new();
 
     while let Some(record) = reader.next()? {

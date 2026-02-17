@@ -117,11 +117,13 @@ When adding new fields to `CompressConfig` in `crates/qz-lib/src/cli.rs`, you mu
 ## Compression Performance (10M reads, 150bp WGS, 72 threads)
 | Tool | Size (MB) | Ratio | Compress | Decompress |
 |------|-----------|-------|----------|------------|
-| QZ default | 435 | 8.03x | 17.6s | 14.7s |
-| QZ ultra 3 | 416 | 8.39x | 34.2s | 21.3s |
-| SPRING | 431 | 8.10x | 65.2s | 16.9s |
-| bzip2 -9 | 542 | 6.44x | 168.5s | 88.2s |
-| pigz -9 | 695 | 5.02x | 10.0s | 8.0s |
+| QZ default | 435 | 8.03x | 17.4s | 13.8s |
+| QZ ultra 1 | 426 | 8.21x | 28.4s | 14.2s |
+| QZ ultra 3 | 416 | 8.39x | 37.1s | 21.6s |
+| QZ ultra 5 | 416 | 8.39x | 31.4s | 1:02.5 |
+| SPRING | 431 | 8.10x | 1:01.4 | 15.4s |
+| bzip2 -9 | 542 | 6.44x | 2:47.8 | 1:26.6 |
+| pigz -9 | 695 | 5.02x | 9.7s | 7.9s |
 
 ## Changelog
 All user-visible changes (new features, breaking changes, removals, bug fixes) must be recorded in `CHANGELOG.md` at the project root. Update it as part of the same change, not as a separate step.

@@ -24,6 +24,7 @@ debug = true
 anyhow = "1.0"
 rayon = "1.10"
 flate2 = "1.0"
+gzp = { version = "0.11", default-features = false, features = ["deflate_default"] }
 zstd = "0.13"
 constriction = "0.4"
 openzl-sys = "0.1"
